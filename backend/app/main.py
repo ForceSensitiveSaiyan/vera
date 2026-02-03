@@ -84,7 +84,14 @@ async def upload_document(file: UploadFile = File(...)):
                 )
             )
             session.commit()
-        celery_app.send_task("vera.process_document", args=[document_id])
+        task_result = celery_app.send_task("vera.process_document", args=[document_id])
+        with get_session() as session:
+            session.execute(
+                update(Document)
+                .where(Document.id == document_id)
+                .values(processing_task_id=task_result.id)
+            )
+            session.commit()
     except RuntimeError as error:
         if str(error) == "celery_not_installed":
             raise HTTPException(status_code=503, detail="Background worker is not available")
@@ -192,6 +199,48 @@ async def get_document(document_id: str):
                 "structured_fields": structured_fields,
             }
         )
+
+
+@app.post("/documents/{document_id}/cancel")
+async def cancel_document(document_id: str):
+    logger.info("Cancel requested document_id=%s", document_id)
+    if not hasattr(celery_app, "control"):
+        raise HTTPException(status_code=503, detail="Background worker is not available")
+
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if document.status not in (DocumentStatus.uploaded.value, DocumentStatus.processing.value):
+            raise HTTPException(status_code=409, detail="Document is not processing")
+
+        task_id = getattr(document, "processing_task_id")
+        if not task_id:
+            raise HTTPException(status_code=409, detail="No active task to cancel")
+
+        try:
+            celery_app.control.revoke(task_id, terminate=True)
+        except Exception:  # pragma: no cover
+            logger.exception("Failed to revoke task document_id=%s task_id=%s", document_id, task_id)
+            raise HTTPException(status_code=500, detail="Failed to cancel processing")
+
+        session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(status=DocumentStatus.canceled.value, processing_task_id=None)
+        )
+        session.add(
+            AuditLog(
+                id=os.urandom(16).hex(),
+                document_id=document_id,
+                event_type="ocr_canceled",
+                detail=json.dumps({"task_id": task_id}),
+            )
+        )
+        session.commit()
+
+    return JSONResponse({"status": DocumentStatus.canceled.value})
 
 
 @app.get("/documents/{document_id}/summary")

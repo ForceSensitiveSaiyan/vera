@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export type TokenBox = {
   id: string;
@@ -17,6 +17,7 @@ type ImageOverlayProps = {
   imageHeight: number;
   selectedTokenId: string | null;
   onSelect: (tokenId: string) => void;
+  disabled?: boolean;
 };
 
 export function ImageOverlay({
@@ -26,23 +27,25 @@ export function ImageOverlay({
   imageHeight,
   selectedTokenId,
   onSelect,
+  disabled = false,
 }: ImageOverlayProps) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const [renderedSize, setRenderedSize] = useState({ width: 1, height: 1 });
 
-  useEffect(() => {
+  const updateSize = useCallback(() => {
     const image = imageRef.current;
     if (!image) return;
-
-    const updateSize = () => {
-      const rect = image.getBoundingClientRect();
+    const rect = image.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
       setRenderedSize({ width: rect.width, height: rect.height });
-    };
+    }
+  }, []);
 
+  useEffect(() => {
     updateSize();
     window.addEventListener("resize", updateSize);
     return () => window.removeEventListener("resize", updateSize);
-  }, []);
+  }, [updateSize]);
 
   const safeWidth = Math.max(imageWidth, 1);
   const safeHeight = Math.max(imageHeight, 1);
@@ -50,11 +53,12 @@ export function ImageOverlay({
   const scaleY = renderedSize.height / safeHeight;
 
   return (
-    <div className="image-overlay">
+    <div className={`image-overlay${disabled ? " is-disabled" : ""}`}>
       <img
         ref={imageRef}
         src={imageUrl}
         alt="Uploaded document"
+        onLoad={updateSize}
       />
       {tokens.map((token) => {
         const [x, y, w, h] = token.bbox;
@@ -75,6 +79,7 @@ export function ImageOverlay({
               padding: 0,
             }}
             aria-label={`Token ${token.text}`}
+            disabled={disabled}
           />
         );
       })}

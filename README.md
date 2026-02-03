@@ -24,6 +24,12 @@ Validation is a hard gate. Summaries and exports are only available after explic
 3. Frontend: `http://localhost:3000`
 4. Backend: `http://localhost:4000`
 
+If your database already has tables but Alembic has never been run (no `alembic_version` table),
+you will see a `DuplicateTable` error when running migrations. In that case, stamp the baseline
+before upgrading so Alembic knows the current schema state:
+1. `docker compose exec backend alembic stamp 0001_create_tables`
+2. `docker compose exec backend alembic upgrade head`
+
 ## Getting Started (Local)
 1. Backend: `cd backend` → `pip install -r requirements.txt`
 2. Set `DATABASE_URL` (Postgres recommended). Example:
@@ -33,6 +39,22 @@ Validation is a hard gate. Summaries and exports are only available after explic
 5. Start worker: `celery -A app.worker.celery_app worker --loglevel=info --concurrency=2`
 6. Frontend: `cd frontend` → `npm install` → `npm run dev`
 
+If your local database was created before Alembic was introduced, use the same baseline stamp
+to avoid `DuplicateTable` errors:
+1. `alembic stamp 0001_create_tables`
+2. `alembic upgrade head`
+
 ## Notes
 - PDF support requires Poppler (Docker image installs it automatically).
 - Summaries and exports are gated behind explicit review completion.
+
+## Optional LLM summaries (Ollama)
+VERA can optionally call an Ollama instance to generate smart summary points. This is disabled by default.
+
+Environment variables:
+- `LLM_SUMMARY_ENABLED` (default: `false`)
+- `OLLAMA_URL` (default: `http://ollama:11434`)
+- `OLLAMA_MODEL` (default: `llama3.1`)
+
+When enabled, the backend will call `POST /api/generate` on the Ollama URL and use the returned bullet points
+in the Summary view.

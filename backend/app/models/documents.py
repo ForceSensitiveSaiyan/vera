@@ -14,6 +14,7 @@ class Document(Base):
     image_width = Column(Integer, nullable=False)
     image_height = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
+    processing_task_id = Column(String, nullable=True)
     validated_text = Column(Text, nullable=True)
     structured_fields = Column(Text, nullable=False, default="{}")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

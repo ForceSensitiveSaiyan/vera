@@ -14,6 +14,7 @@ class DocumentStatus(str, Enum):
     summarized = "summarized"
     exported = "exported"
     failed = "failed"
+    canceled = "canceled"
 
 
 class TokenConfidenceLabel(str, Enum):

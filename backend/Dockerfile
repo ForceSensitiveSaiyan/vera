@@ -9,6 +9,9 @@ RUN apt-get update \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY scripts ./scripts
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000

@@ -105,6 +105,20 @@ def _extract_tokens(image_path: str) -> list[dict]:
 def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> OcrResult:
     Base.metadata.create_all(bind=engine)
     logger.info("OCR start document_id=%s", document_id)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        if document is None:
+            raise ValueError("document_not_found")
+        if document.status == DocumentStatus.canceled.value:
+            logger.info("OCR canceled before start document_id=%s", document_id)
+            return OcrResult(
+                document_id=document_id,
+                image_url=image_url,
+                tokens=[],
+                status=DocumentStatus.canceled,
+                image_width=int(getattr(document, "image_width")),
+                image_height=int(getattr(document, "image_height")),
+            )
     with Image.open(image_path) as image:
         image_width, image_height = image.size
 
@@ -117,6 +131,17 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
         if document is None:
             raise ValueError("document_not_found")
 
+        if document.status == DocumentStatus.canceled.value:
+            logger.info("OCR canceled after extraction document_id=%s", document_id)
+            return OcrResult(
+                document_id=document_id,
+                image_url=image_url,
+                tokens=[],
+                status=DocumentStatus.canceled,
+                image_width=image_width,
+                image_height=image_height,
+            )
+
         session.execute(Token.__table__.delete().where(Token.document_id == document_id))
         session.execute(
             Document.__table__.update()
@@ -126,6 +151,7 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
                 image_width=image_width,
                 image_height=image_height,
                 status=DocumentStatus.ocr_done.value,
+                processing_task_id=None,
             )
         )
 

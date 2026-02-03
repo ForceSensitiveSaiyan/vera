@@ -5,9 +5,10 @@ type TokenListProps = {
   selectedTokenId: string | null;
   onSelect: (tokenId: string) => void;
   reviewedTokenIds: Set<string>;
+  disabled?: boolean;
 };
 
-export function TokenList({ tokens, selectedTokenId, onSelect, reviewedTokenIds }: TokenListProps) {
+export function TokenList({ tokens, selectedTokenId, onSelect, reviewedTokenIds, disabled = false }: TokenListProps) {
   return (
     <ul className="token-list">
       {tokens.map((token) => (
@@ -16,6 +17,7 @@ export function TokenList({ tokens, selectedTokenId, onSelect, reviewedTokenIds 
             type="button"
             onClick={() => onSelect(token.id)}
             className={`token-button${token.id === selectedTokenId ? " is-selected" : ""}`}
+            disabled={disabled}
           >
             <div className="token-title">
               <span>{token.text || "(empty)"}</span>

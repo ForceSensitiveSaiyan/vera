@@ -32,6 +32,12 @@ type SummaryPayload = {
   structured_fields: Record<string, string>;
 };
 
+type ToastMessage = {
+  id: string;
+  message: string;
+  variant: "error" | "info";
+};
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 function severityScore(token: TokenBox) {
@@ -50,7 +56,25 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAllTokens, setShowAllTokens] = useState(false);
+  const [pollingEnabled, setPollingEnabled] = useState(true);
+  const [processingCanceled, setProcessingCanceled] = useState(false);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const isProcessing = documentData ? ["uploaded", "processing"].includes(documentData.status) : false;
+  const processingActive = isProcessing && pollingEnabled;
+  const interactionDisabled = loading || processingActive;
+  const statusDotClass = isProcessing ? "status-indexing" : "status-ready";
+  const documentTypeOptions = [
+    "Unknown",
+    "Invoice/Receipt",
+    "Statement",
+    "Purchase order",
+    "Shipping/Delivery",
+    "Legal/Contract",
+    "Form/Application",
+    "Report",
+    "Letter/Correspondence",
+    "ID/Certificate",
+  ];
 
   const allTokens = useMemo<TokenBox[]>(() => {
     if (!documentData) return [];
@@ -86,11 +110,24 @@ export default function HomePage() {
   const reviewedCount = flaggedTokens.filter((token) => reviewedTokenIds.has(token.id)).length;
   const reviewProgress = flaggedTokens.length ? Math.round((reviewedCount / flaggedTokens.length) * 100) : 0;
 
+  const pushToast = (message: string, variant: ToastMessage["variant"] = "error") => {
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+    setToasts((prev) => [...prev, { id, message, variant }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    }, 5000);
+  };
+
   const uploadDocument = async () => {
     if (!file) return;
     setLoading(true);
     setError(null);
     setSummary(null);
+    setPollingEnabled(true);
+    setProcessingCanceled(false);
     try {
       const formData = new FormData();
       formData.append("file", file);
@@ -116,13 +153,14 @@ export default function HomePage() {
       const message = err instanceof Error ? err.message : "Upload failed";
       console.error("Upload failed", err);
       setError(message);
+      pushToast(message, "error");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    if (!documentData || !isProcessing) return;
+    if (!documentData || !processingActive) return;
     const interval = window.setInterval(async () => {
       try {
         const response = await fetch(`${apiBase}/documents/${documentData.document_id}`);
@@ -141,7 +179,7 @@ export default function HomePage() {
       }
     }, 1500);
     return () => window.clearInterval(interval);
-  }, [apiBase, documentData, isProcessing]);
+  }, [apiBase, documentData, processingActive]);
 
   const buildCorrectionsPayload = () => {
     const payload: Array<{ token_id: string; corrected_text: string }> = [];
@@ -187,6 +225,7 @@ export default function HomePage() {
       const message = err instanceof Error ? err.message : "Validation failed";
       console.error("Validation failed", err);
       setError(message);
+      pushToast(message, "error");
     } finally {
       setLoading(false);
     }
@@ -215,18 +254,138 @@ export default function HomePage() {
       const message = err instanceof Error ? err.message : "Export failed";
       console.error("Export failed", err);
       setError(message);
+      pushToast(message, "error");
     } finally {
       setLoading(false);
     }
   };
 
+  const updateDocumentType = async (value: string) => {
+    if (!documentData) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${apiBase}/documents/${documentData.document_id}/fields`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          structured_fields: {
+            ...(documentData.structured_fields ?? {}),
+            document_type: value,
+          },
+        }),
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Document type update failed");
+      }
+      setDocumentData((prev) =>
+        prev
+          ? {
+              ...prev,
+              structured_fields: {
+                ...prev.structured_fields,
+                document_type: value,
+              },
+            }
+          : prev
+      );
+      setSummary((prev) =>
+        prev
+          ? {
+              ...prev,
+              structured_fields: {
+                ...prev.structured_fields,
+                document_type: value,
+              },
+            }
+          : prev
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Document type update failed";
+      console.error("Document type update failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const findNextTokenId = (currentId: string, nextReviewed: Set<string>) => {
+    if (!flaggedTokens.length) return null;
+    const startIndex = flaggedTokens.findIndex((token) => token.id === currentId);
+    const isUnreviewed = (tokenId: string) => !nextReviewed.has(tokenId);
+
+    for (let index = startIndex + 1; index < flaggedTokens.length; index += 1) {
+      if (isUnreviewed(flaggedTokens[index].id)) return flaggedTokens[index].id;
+    }
+
+    for (let index = 0; index <= startIndex; index += 1) {
+      if (isUnreviewed(flaggedTokens[index].id)) return flaggedTokens[index].id;
+    }
+
+    return null;
+  };
+
+  const cancelProcessing = async () => {
+    if (!documentData) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`${apiBase}/documents/${documentData.document_id}/cancel`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Cancel failed");
+      }
+      const data = (await response.json()) as { status: string };
+      setDocumentData((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: data.status,
+            }
+          : prev
+      );
+      setPollingEnabled(false);
+      setProcessingCanceled(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Cancel failed";
+      console.error("Cancel failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const resumeProcessing = () => {
+    setPollingEnabled(true);
+    setProcessingCanceled(false);
+  };
+
   const handleMarkReviewed = () => {
-    if (!selectedToken) return;
-    setReviewedTokenIds((prev) => new Set([...prev, selectedToken.id]));
+    if (!selectedToken || interactionDisabled) return;
+    setReviewedTokenIds((prev) => {
+      const next = new Set(prev);
+      next.add(selectedToken.id);
+      setSelectedTokenId(findNextTokenId(selectedToken.id, next));
+      return next;
+    });
+  };
+
+  const handleUnmarkReviewed = () => {
+    if (!selectedToken || interactionDisabled) return;
+    setReviewedTokenIds((prev) => {
+      const next = new Set(prev);
+      next.delete(selectedToken.id);
+      return next;
+    });
   };
 
   const handleRevert = () => {
-    if (!selectedToken) return;
+    if (!selectedToken || interactionDisabled) return;
     setCorrections((prev) => {
       const next = { ...prev };
       delete next[selectedToken.id];
@@ -236,28 +395,21 @@ export default function HomePage() {
 
   return (
     <>
-      {loading && !documentData ? (
-        <div className="loading-overlay" role="status" aria-live="polite">
-          <div className="loading-panel">
-            <div className="daisy" aria-hidden="true">
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-petal" />
-              <span className="daisy-core" />
+      {toasts.length ? (
+        <div className="toast-stack" role="status" aria-live="polite">
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              className={`toast toast-${toast.variant}`}
+            >
+              {toast.message}
             </div>
-            <div className="loading-title">Running OCR</div>
-            <div className="form-hint">First run may download model assets.</div>
-          </div>
+          ))}
         </div>
       ) : null}
       <header className="header">
         <div className="header-left">
-          <span className={`status-dot ${documentData ? "status-ready" : "status-indexing"}`} />
+          <span className={`status-dot ${statusDotClass}`} />
           <span className="logo">VERA</span>
           <span className="header-divider">/</span>
           <span className="header-title">Verification-first OCR</span>
@@ -279,28 +431,52 @@ export default function HomePage() {
                   type="file"
                   accept="image/png,image/jpeg,application/pdf"
                   onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+                  disabled={interactionDisabled}
                 />
-                <button type="button" onClick={uploadDocument} disabled={!file || loading} className="btn btn-primary">
-                  {loading ? "Uploading..." : "Run OCR"}
+                <button
+                  type="button"
+                  onClick={uploadDocument}
+                  disabled={!file || interactionDisabled}
+                  className="btn btn-primary"
+                >
+                  {processingActive ? "Processing..." : loading && !documentData ? "Uploading..." : "Run OCR"}
                 </button>
-                <label className="form-check">
-                  <input
-                    type="checkbox"
-                    checked={showAllTokens}
-                    onChange={(event) => setShowAllTokens(event.target.checked)}
-                  />
-                  <span className="form-check-label">Show all tokens</span>
-                </label>
               </div>
+              {processingActive ? (
+                <div className="processing-banner" role="status" aria-live="polite">
+                  <div className="processing-info">
+                    <div className="processing-title">Processing OCR</div>
+                    <div className="processing-subtitle">Extracting text and confidence scores.</div>
+                  </div>
+                  <div className="processing-actions">
+                    <button type="button" onClick={cancelProcessing} className="btn btn-secondary" disabled={loading}>
+                      Cancel processing
+                    </button>
+                  </div>
+                  <div className="processing-bar" aria-hidden="true">
+                    <div className="processing-bar-fill" />
+                  </div>
+                </div>
+              ) : null}
+              {isProcessing && processingCanceled ? (
+                <div className="alert alert-info processing-paused">
+                  <span>Processing canceled locally. Resume status checks to fetch results.</span>
+                  <button type="button" onClick={resumeProcessing} className="btn btn-secondary btn-sm">
+                    Resume status checks
+                  </button>
+                </div>
+              ) : null}
               {loading && !documentData ? (
                 <div className="alert alert-info">
                   Running OCR. First run may download model assets.
                 </div>
               ) : null}
-              {isProcessing ? (
+              {processingActive ? (
                 <div className="alert alert-info">OCR is running. Tokens will appear when processing completes.</div>
               ) : null}
-              {error ? <div className="alert alert-error">{error}</div> : null}
+              {documentData?.status === "canceled" ? (
+                <div className="alert alert-error">Processing was canceled. Upload a new document to restart.</div>
+              ) : null}
             </div>
           </div>
 
@@ -309,23 +485,41 @@ export default function HomePage() {
               <div className="card">
                 <div className="card-header">
                   <div className="card-title">Document</div>
-                  {documentData ? (
-                    <span
-                      className={`status-pill ${
-                        documentData.status === "failed"
-                          ? "status-pill-error"
-                          : isProcessing
-                          ? "status-pill-processing"
-                          : "status-pill-ready"
-                      }`}
+                  <div className="card-header-actions">
+                    <button
+                      type="button"
+                      onClick={() => setShowAllTokens((prev) => !prev)}
+                      className="btn btn-secondary btn-sm"
+                      disabled={interactionDisabled || !documentData}
                     >
-                      {documentData.status === "failed"
-                        ? "Failed"
-                        : isProcessing
-                        ? "Processing"
-                        : "Ready"}
-                    </span>
-                  ) : null}
+                      {showAllTokens ? "Show flagged tokens" : "Show all tokens"}
+                    </button>
+                    {documentData ? (
+                      <span
+                        className={`status-pill ${
+                          documentData.status === "failed"
+                            ? "status-pill-error"
+                            : documentData.status === "canceled"
+                            ? "status-pill-paused"
+                            : isProcessing
+                            ? processingCanceled
+                              ? "status-pill-paused"
+                              : "status-pill-processing"
+                            : "status-pill-ready"
+                        }`}
+                      >
+                        {documentData.status === "failed"
+                          ? "Failed"
+                          : documentData.status === "canceled"
+                          ? "Canceled"
+                          : isProcessing
+                          ? processingCanceled
+                            ? "Paused"
+                            : "Processing"
+                          : "Ready"}
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="card-body">
                   {documentData ? (
@@ -336,6 +530,7 @@ export default function HomePage() {
                       tokens={displayTokens}
                       selectedTokenId={selectedTokenId}
                       onSelect={setSelectedTokenId}
+                      disabled={interactionDisabled}
                     />
                   ) : (
                     <div className="upload-zone">
@@ -354,6 +549,10 @@ export default function HomePage() {
                   <SummaryView
                     bulletSummary={summary?.bullet_summary ?? []}
                     structuredFields={summary?.structured_fields}
+                    documentTypeOptions={documentTypeOptions}
+                    documentTypeValue={summary?.structured_fields?.document_type}
+                    onDocumentTypeChange={updateDocumentType}
+                    disabled={interactionDisabled}
                   />
                 </div>
               </div>
@@ -376,6 +575,7 @@ export default function HomePage() {
                     selectedTokenId={selectedTokenId}
                     onSelect={setSelectedTokenId}
                     reviewedTokenIds={reviewedTokenIds}
+                    disabled={interactionDisabled}
                   />
                 </div>
               </div>
@@ -392,19 +592,17 @@ export default function HomePage() {
                       if (!selectedToken) return;
                       setCorrections((prev) => ({ ...prev, [selectedToken.id]: value }));
                     }}
-                    onSave={(value) => {
-                      if (!selectedToken) return;
-                      setCorrections((prev) => ({ ...prev, [selectedToken.id]: value }));
-                      setReviewedTokenIds((prev) => new Set([...prev, selectedToken.id]));
-                    }}
                     onMarkReviewed={handleMarkReviewed}
+                    onUnmarkReviewed={handleUnmarkReviewed}
                     onRevert={handleRevert}
+                    disabled={interactionDisabled}
+                    isReviewed={selectedToken ? reviewedTokenIds.has(selectedToken.id) : false}
                   />
                   <div className="vera-stack">
                     <button
                       type="button"
                       onClick={() => saveProgress(false)}
-                      disabled={!documentData || loading}
+                      disabled={!documentData || interactionDisabled}
                       className="btn btn-secondary"
                     >
                       Save progress
@@ -412,7 +610,7 @@ export default function HomePage() {
                     <button
                       type="button"
                       onClick={() => saveProgress(true)}
-                      disabled={!documentData || loading}
+                      disabled={!documentData || interactionDisabled}
                       className="btn btn-primary"
                     >
                       Confirm and generate summary
@@ -429,7 +627,7 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => exportDocument("json")}
-                    disabled={!summary || loading}
+                    disabled={!summary || interactionDisabled}
                     className="btn btn-secondary"
                   >
                     Export JSON
@@ -437,7 +635,7 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => exportDocument("csv")}
-                    disabled={!summary || loading}
+                    disabled={!summary || interactionDisabled}
                     className="btn btn-secondary"
                   >
                     Export CSV
@@ -445,7 +643,7 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => exportDocument("txt")}
-                    disabled={!summary || loading}
+                    disabled={!summary || interactionDisabled}
                     className="btn btn-secondary"
                   >
                     Export TXT

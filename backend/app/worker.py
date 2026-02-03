@@ -58,14 +58,16 @@ def process_document(document_id: str) -> dict[str, str]:
 
     try:
         image_url = f"/files/{os.path.basename(image_path)}"
-        run_ocr_for_document(document_id, image_path, image_url)
+        result = run_ocr_for_document(document_id, image_path, image_url)
+        if result.status == DocumentStatus.canceled:
+            return {"status": "canceled"}
         return {"status": "completed"}
     except Exception as exc:  # pragma: no cover
         with get_session() as session:
             session.execute(
                 Document.__table__.update()
                 .where(Document.id == document_id)
-                .values(status=DocumentStatus.failed.value)
+                .values(status=DocumentStatus.failed.value, processing_task_id=None)
             )
             session.add(
                 AuditLog(
