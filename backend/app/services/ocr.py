@@ -129,7 +129,9 @@ async def run_ocr(file: UploadFile) -> OcrResult:
             flags = detect_forced_flags(raw["text"])
             forced_review = confidence_label != TokenConfidenceLabel.trusted or len(flags) > 0
             bbox = raw["bbox"]
-            token_id = f"l{raw['line_index']}-t{raw['token_index']}-{_bbox_hash(bbox)}"
+            token_id = (
+                f"{document_id}-l{raw['line_index']}-t{raw['token_index']}-{_bbox_hash(bbox)}"
+            )
 
             token = Token(
                 id=token_id,

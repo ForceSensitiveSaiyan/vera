@@ -213,6 +213,25 @@ export default function HomePage() {
 
   return (
     <>
+      {loading && !documentData ? (
+        <div className="loading-overlay" role="status" aria-live="polite">
+          <div className="loading-panel">
+            <div className="daisy" aria-hidden="true">
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-petal" />
+              <span className="daisy-core" />
+            </div>
+            <div className="loading-title">Running OCR</div>
+            <div className="form-hint">First run may download model assets.</div>
+          </div>
+        </div>
+      ) : null}
       <header className="header">
         <div className="header-left">
           <span className={`status-dot ${documentData ? "status-ready" : "status-indexing"}`} />
@@ -250,6 +269,11 @@ export default function HomePage() {
                   <span className="form-check-label">Show all tokens</span>
                 </label>
               </div>
+              {loading && !documentData ? (
+                <div className="alert alert-info">
+                  Running OCR. First run may download model assets.
+                </div>
+              ) : null}
               {error ? <div className="alert alert-error">{error}</div> : null}
             </div>
           </div>

@@ -501,6 +501,133 @@ body {
     border-color: #fecaca;
 }
 
+.alert-info {
+    background: var(--primary-light);
+    color: var(--primary);
+    border-color: #bfdbfe;
+}
+
+.loading-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    backdrop-filter: blur(2px);
+}
+
+.loading-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-6) var(--space-8);
+    box-shadow: var(--shadow-lg);
+    min-width: 240px;
+}
+
+.loading-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.daisy {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    animation: daisy-spin 2.2s linear infinite;
+}
+
+.daisy-petal {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 12px;
+    height: 24px;
+    background: var(--primary);
+    border-radius: 12px 12px 6px 6px;
+    transform-origin: center 26px;
+    opacity: 0.7;
+    animation: petal-pulse 1.2s ease-in-out infinite;
+}
+
+.daisy-petal:nth-child(1) {
+    transform: rotate(0deg) translateY(-26px);
+    animation-delay: 0s;
+}
+
+.daisy-petal:nth-child(2) {
+    transform: rotate(45deg) translateY(-26px);
+    animation-delay: 0.15s;
+}
+
+.daisy-petal:nth-child(3) {
+    transform: rotate(90deg) translateY(-26px);
+    animation-delay: 0.3s;
+}
+
+.daisy-petal:nth-child(4) {
+    transform: rotate(135deg) translateY(-26px);
+    animation-delay: 0.45s;
+}
+
+.daisy-petal:nth-child(5) {
+    transform: rotate(180deg) translateY(-26px);
+    animation-delay: 0.6s;
+}
+
+.daisy-petal:nth-child(6) {
+    transform: rotate(225deg) translateY(-26px);
+    animation-delay: 0.75s;
+}
+
+.daisy-petal:nth-child(7) {
+    transform: rotate(270deg) translateY(-26px);
+    animation-delay: 0.9s;
+}
+
+.daisy-petal:nth-child(8) {
+    transform: rotate(315deg) translateY(-26px);
+    animation-delay: 1.05s;
+}
+
+.daisy-core {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 16px;
+    height: 16px;
+    background: #facc15;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 0 4px rgba(250, 204, 21, 0.2);
+}
+
+@keyframes daisy-spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes petal-pulse {
+    0%,
+    100% {
+        opacity: 0.5;
+    }
+    50% {
+        opacity: 1;
+    }
+}
+
 @media (max-width: 900px) {
     .vera-grid {
         grid-template-columns: 1fr;

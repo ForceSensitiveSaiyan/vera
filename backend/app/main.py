@@ -7,6 +7,7 @@ import logging
 import time
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -98,10 +99,10 @@ async def upload_document(file: UploadFile = File(...)):
         "image_width": ocr_result.image_width,
         "image_height": ocr_result.image_height,
         "status": ocr_result.status,
-        "tokens": ocr_result.tokens,
+        "tokens": [token.model_dump() for token in ocr_result.tokens],
         "structured_fields": {},
     }
-    return JSONResponse(payload)
+    return JSONResponse(jsonable_encoder(payload))
 
 
 @app.post("/documents/{document_id}/validate")
@@ -123,12 +124,14 @@ async def validate_document(document_id: str, payload: ValidateRequest):
         raise
     logger.info("Validate completed document_id=%s status=%s", document_id, status)
     return JSONResponse(
-        {
-            "validated_text": validated_text,
-            "validation_status": status,
-            "validated_at": validated_at,
-            "structured_fields": payload.structured_fields or {},
-        }
+        jsonable_encoder(
+            {
+                "validated_text": validated_text,
+                "validation_status": status,
+                "validated_at": validated_at,
+                "structured_fields": payload.structured_fields or {},
+            }
+        )
     )
 
 
