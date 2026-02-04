@@ -21,7 +21,9 @@ export function TokenList({ tokens, selectedTokenId, onSelect, reviewedTokenIds,
           >
             <div className="token-title">
               <span>{token.text || "(empty)"}</span>
-              <span className="token-meta">
+              <span
+                className={`token-status ${reviewedTokenIds.has(token.id) ? "token-status-reviewed" : "token-status-pending"}`}
+              >
                 {reviewedTokenIds.has(token.id) ? "Reviewed" : "Needs review"}
               </span>
             </div>

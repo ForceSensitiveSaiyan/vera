@@ -24,7 +24,7 @@ class UploadLike(Protocol):
     file: BinaryIO
 
 
-def save_upload(file: UploadFile | UploadLike) -> tuple[str, str, str]:
+def save_upload(file: UploadFile | UploadLike) -> tuple[str, str, str, list[dict]]:
     data_dir = ensure_data_dir()
     extension = os.path.splitext(file.filename or "")[-1].lower()
     logger.debug("Save upload filename=%s extension=%s", file.filename, extension)
@@ -43,15 +43,26 @@ def save_upload(file: UploadFile | UploadLike) -> tuple[str, str, str]:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("pdf_support_not_installed") from exc
 
-        images = convert_from_path(original_path, fmt="png", first_page=1, last_page=1)
+        images = convert_from_path(original_path, fmt="png")
         if not images:
             raise RuntimeError("pdf_no_pages")
         logger.info("PDF converted filename=%s pages=%s", file.filename, len(images))
-        image_filename = f"{document_id}.png"
-        image_path = os.path.join(data_dir, image_filename)
-        images[0].save(image_path, "PNG")
-        image_url = f"/files/{image_filename}"
-        return document_id, image_path, image_url
+        pages: list[dict] = []
+        for index, image in enumerate(images):
+            image_filename = f"{document_id}-page-{index}.png"
+            image_path = os.path.join(data_dir, image_filename)
+            image.save(image_path, "PNG")
+            pages.append(
+                {
+                    "page_index": index,
+                    "image_path": image_path,
+                    "image_url": f"/files/{image_filename}",
+                }
+            )
+
+        first_page = pages[0]
+        return document_id, first_page["image_path"], first_page["image_url"], pages
 
     image_url = f"/files/{filename}"
-    return document_id, original_path, image_url
+    pages = [{"page_index": 0, "image_path": original_path, "image_url": image_url}]
+    return document_id, original_path, image_url, pages

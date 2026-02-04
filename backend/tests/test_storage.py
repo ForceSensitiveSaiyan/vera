@@ -28,17 +28,20 @@ def test_save_upload_rejects_unknown_extension(tmp_path, monkeypatch):
     assert str(error.value) == "unsupported_file_type"
 
 
-def test_save_upload_pdf_converts_first_page(tmp_path, monkeypatch):
+def test_save_upload_pdf_converts_pages(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     upload = cast(UploadFile, DummyUpload("sample.pdf", b"%PDF-1.4"))
     fake_image = Image.new("RGB", (10, 10), "white")
+    fake_image_two = Image.new("RGB", (10, 10), "white")
 
     fake_pdf2image = cast(Any, types.ModuleType("pdf2image"))
-    fake_pdf2image.convert_from_path = lambda *args, **kwargs: [fake_image]
+    fake_pdf2image.convert_from_path = lambda *args, **kwargs: [fake_image, fake_image_two]
     with patch.dict(sys.modules, {"pdf2image": fake_pdf2image}):
-        document_id, image_path, image_url = save_upload(upload)
+        document_id, image_path, image_url, pages = save_upload(upload)
 
     assert document_id
     assert image_path.endswith(".png")
     assert image_url.endswith(".png")
-    assert (tmp_path / f"{document_id}.png").exists()
+    assert len(pages) == 2
+    assert (tmp_path / f"{document_id}-page-0.png").exists()
+    assert (tmp_path / f"{document_id}-page-1.png").exists()

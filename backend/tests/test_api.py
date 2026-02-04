@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.db.session import Base, engine, get_session
 from app.main import app
-from app.models.documents import AuditLog, Correction, Document, Token
+from app.models.documents import AuditLog, Correction, Document, DocumentPage, Token
 from app.schemas.documents import DocumentStatus
 
 
@@ -15,17 +15,15 @@ client = TestClient(app)
 
 
 def _reset_db() -> None:
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     with get_session() as session:
-        session.execute(AuditLog.__table__.delete())
-        session.execute(Correction.__table__.delete())
-        session.execute(Token.__table__.delete())
-        session.execute(Document.__table__.delete())
         session.commit()
 
 
-def _create_document(status: str) -> str:
+def _create_document(status: str) -> tuple[str, str]:
     document_id = uuid.uuid4().hex
+    page_id = uuid.uuid4().hex
     with get_session() as session:
         session.add(
             Document(
@@ -35,19 +33,65 @@ def _create_document(status: str) -> str:
                 image_height=200,
                 status=status,
                 structured_fields=json.dumps({}),
+                page_count=1,
+            )
+        )
+        session.add(
+            DocumentPage(
+                id=page_id,
+                document_id=document_id,
+                page_index=0,
+                image_path="/tmp/sample.png",
+                image_width=100,
+                image_height=200,
+                status=status,
             )
         )
         session.commit()
-    return document_id
+    return document_id, page_id
 
 
-def _create_token(document_id: str, *, forced_review: bool, text: str = "Item") -> str:
+def _create_document_with_pages(status: str, page_count: int) -> tuple[str, list[str]]:
+    document_id = uuid.uuid4().hex
+    page_ids: list[str] = []
+    with get_session() as session:
+        session.add(
+            Document(
+                id=document_id,
+                image_path="/tmp/sample.png",
+                image_width=100,
+                image_height=200,
+                status=status,
+                structured_fields=json.dumps({}),
+                page_count=page_count,
+            )
+        )
+        for index in range(page_count):
+            page_id = uuid.uuid4().hex
+            page_ids.append(page_id)
+            session.add(
+                DocumentPage(
+                    id=page_id,
+                    document_id=document_id,
+                    page_index=index,
+                    image_path=f"/tmp/sample-{index}.png",
+                    image_width=100,
+                    image_height=200,
+                    status=status,
+                )
+            )
+        session.commit()
+    return document_id, page_ids
+
+
+def _create_token(document_id: str, page_id: str, *, forced_review: bool, text: str = "Item") -> str:
     token_id = uuid.uuid4().hex
     with get_session() as session:
         session.add(
             Token(
                 id=token_id,
                 document_id=document_id,
+                page_id=page_id,
                 line_index=0,
                 token_index=0,
                 text=text,
@@ -65,8 +109,8 @@ def _create_token(document_id: str, *, forced_review: bool, text: str = "Item") 
 
 def test_validate_requires_review_for_forced_tokens():
     _reset_db()
-    document_id = _create_document(DocumentStatus.ocr_done.value)
-    _create_token(document_id, forced_review=True)
+    document_id, page_id = _create_document(DocumentStatus.ocr_done.value)
+    _create_token(document_id, page_id, forced_review=True)
 
     response = client.post(
         f"/documents/{document_id}/validate",
@@ -79,8 +123,8 @@ def test_validate_requires_review_for_forced_tokens():
 
 def test_validate_allows_review_complete_with_reviewed_tokens():
     _reset_db()
-    document_id = _create_document(DocumentStatus.ocr_done.value)
-    token_id = _create_token(document_id, forced_review=True, text="Total")
+    document_id, page_id = _create_document(DocumentStatus.ocr_done.value)
+    token_id = _create_token(document_id, page_id, forced_review=True, text="Total")
 
     response = client.post(
         f"/documents/{document_id}/validate",
@@ -99,7 +143,7 @@ def test_validate_allows_review_complete_with_reviewed_tokens():
 
 def test_summary_requires_validated_document():
     _reset_db()
-    document_id = _create_document(DocumentStatus.review_in_progress.value)
+    document_id, _page_id = _create_document(DocumentStatus.review_in_progress.value)
 
     response = client.get(f"/documents/{document_id}/summary")
 
@@ -109,7 +153,7 @@ def test_summary_requires_validated_document():
 
 def test_summary_returns_generic_structured_fields_from_validated_text():
     _reset_db()
-    document_id = _create_document(DocumentStatus.validated.value)
+    document_id, _page_id = _create_document(DocumentStatus.validated.value)
     with get_session() as session:
         session.execute(
             Document.__table__.update()
@@ -133,7 +177,7 @@ def test_summary_returns_generic_structured_fields_from_validated_text():
 
 def test_summary_detects_patterns_and_normalizes_amounts():
     _reset_db()
-    document_id = _create_document(DocumentStatus.validated.value)
+    document_id, _page_id = _create_document(DocumentStatus.validated.value)
     validated_text = "\n".join(
         [
             "Invoice # INV-1007",
@@ -167,7 +211,7 @@ def test_summary_detects_patterns_and_normalizes_amounts():
 
 def test_export_allows_summarized_documents():
     _reset_db()
-    document_id = _create_document(DocumentStatus.summarized.value)
+    document_id, _page_id = _create_document(DocumentStatus.summarized.value)
     with get_session() as session:
         session.execute(
             Document.__table__.update()
@@ -182,3 +226,90 @@ def test_export_allows_summarized_documents():
     payload = response.json()
     assert payload["document_id"] == document_id
     assert payload["validated_text"] == "Acme Corp"
+
+
+def test_page_summary_requires_validated_page():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+
+    response = client.get(f"/documents/{document_id}/pages/{page_id}/summary")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Review incomplete"
+
+
+def test_page_summary_returns_for_validated_page():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+    with get_session() as session:
+        session.execute(
+            DocumentPage.__table__.update()
+            .where(DocumentPage.id == page_id)
+            .values(status=DocumentStatus.validated.value, validated_text="Acme Corp")
+        )
+        session.commit()
+
+    response = client.get(f"/documents/{document_id}/pages/{page_id}/summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["structured_fields"]["line_count"] == "1"
+
+
+def test_page_export_requires_validated_page():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+
+    response = client.get(f"/documents/{document_id}/pages/{page_id}/export?format=json")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Review incomplete"
+
+
+def test_page_export_allows_validated_page():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+    with get_session() as session:
+        session.execute(
+            DocumentPage.__table__.update()
+            .where(DocumentPage.id == page_id)
+            .values(status=DocumentStatus.validated.value, validated_text="Acme Corp")
+        )
+        session.commit()
+
+    response = client.get(f"/documents/{document_id}/pages/{page_id}/export?format=json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["page_id"] == page_id
+    assert payload["validated_text"] == "Acme Corp"
+
+
+def test_document_summary_requires_all_pages_reviewed():
+    _reset_db()
+    document_id, page_ids = _create_document_with_pages(DocumentStatus.review_in_progress.value, 2)
+
+    response = client.post(
+        f"/documents/{document_id}/pages/{page_ids[0]}/validate",
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True},
+    )
+
+    assert response.status_code == 200
+    summary_response = client.get(f"/documents/{document_id}/summary")
+    assert summary_response.status_code == 409
+    assert summary_response.json()["detail"] == "Document not validated"
+
+
+def test_document_export_requires_all_pages_reviewed():
+    _reset_db()
+    document_id, page_ids = _create_document_with_pages(DocumentStatus.review_in_progress.value, 2)
+
+    response = client.post(
+        f"/documents/{document_id}/pages/{page_ids[0]}/validate",
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True},
+    )
+
+    assert response.status_code == 200
+    export_response = client.get(f"/documents/{document_id}/export?format=json")
+    assert export_response.status_code == 409
+    assert export_response.json()["detail"] == "Document not validated"

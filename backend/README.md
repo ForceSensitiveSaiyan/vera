@@ -22,11 +22,16 @@ Use `docker compose exec backend alembic upgrade head` after first startup.
 - `POST /documents/upload`
 - `GET /documents/{id}`
 - `POST /documents/{id}/validate`
+- `GET /documents/{id}/pages/{page_id}`
+- `POST /documents/{id}/pages/{page_id}/validate`
+- `GET /documents/{id}/pages/{page_id}/summary`
+- `GET /documents/{id}/pages/{page_id}/export`
 - `GET /documents/{id}/summary`
 - `GET /documents/{id}/export`
 - `GET /health`
 
 Validation requires an explicit `review_complete` flag before summaries or exports are available.
+Page summaries/exports are available once that page is reviewed; document summary/export requires all pages.
 
 ## Document lifecycle
 `uploaded -> ocr_done -> review_in_progress -> validated -> summarized -> exported`

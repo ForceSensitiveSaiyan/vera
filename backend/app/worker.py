@@ -8,9 +8,11 @@ except ImportError:  # pragma: no cover
     Celery = None
 
 from app.db.session import Base, engine, get_session
-from app.models.documents import AuditLog, Document
+from sqlalchemy import select
+
+from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
-from app.services.ocr import run_ocr_for_document
+from app.services.ocr import run_ocr_for_page
 
 if Celery is None:  # pragma: no cover
     class _CeleryStub:
@@ -48,19 +50,40 @@ def process_document(document_id: str) -> dict[str, str]:
         document = session.get(Document, document_id)
         if document is None:
             return {"status": "missing"}
-        image_path = str(getattr(document, "image_path"))
         session.execute(
             Document.__table__.update()
             .where(Document.id == document_id)
             .values(status=DocumentStatus.processing.value)
         )
+        session.execute(
+            DocumentPage.__table__.update()
+            .where(DocumentPage.document_id == document_id)
+            .values(status=DocumentStatus.processing.value)
+        )
         session.commit()
 
     try:
-        image_url = f"/files/{os.path.basename(image_path)}"
-        result = run_ocr_for_document(document_id, image_path, image_url)
-        if result.status == DocumentStatus.canceled:
-            return {"status": "canceled"}
+        with get_session() as session:
+            pages = session.execute(
+                select(DocumentPage)
+                .where(DocumentPage.document_id == document_id)
+                .order_by(DocumentPage.page_index.asc())
+            ).scalars().all()
+
+        for page in pages:
+            image_path = str(getattr(page, "image_path"))
+            image_url = f"/files/{os.path.basename(image_path)}"
+            result = run_ocr_for_page(document_id, page.id, image_path, image_url)
+            if result.status == DocumentStatus.canceled:
+                return {"status": "canceled"}
+
+        with get_session() as session:
+            session.execute(
+                Document.__table__.update()
+                .where(Document.id == document_id)
+                .values(status=DocumentStatus.ocr_done.value, processing_task_id=None)
+            )
+            session.commit()
         return {"status": "completed"}
     except Exception as exc:  # pragma: no cover
         with get_session() as session:
@@ -68,6 +91,11 @@ def process_document(document_id: str) -> dict[str, str]:
                 Document.__table__.update()
                 .where(Document.id == document_id)
                 .values(status=DocumentStatus.failed.value, processing_task_id=None)
+            )
+            session.execute(
+                DocumentPage.__table__.update()
+                .where(DocumentPage.document_id == document_id)
+                .values(status=DocumentStatus.failed.value)
             )
             session.add(
                 AuditLog(

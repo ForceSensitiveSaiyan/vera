@@ -8,4 +8,5 @@ Core responsibilities:
 - Highlight low-confidence tokens
 - Inline correction UI
 - Validation submission
-- Summary + export UI
+- Page summaries + exports
+- Document summary + export (multi-page PDFs)

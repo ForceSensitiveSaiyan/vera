@@ -8,10 +8,11 @@ import uuid
 from typing import Any
 
 from fastapi import UploadFile
+from sqlalchemy import select
 from PIL import Image
 
 from app.db.session import Base, engine, get_session
-from app.models.documents import AuditLog, Document, Token
+from app.models.documents import AuditLog, Document, DocumentPage, Token
 from app.schemas.documents import DocumentStatus, TokenConfidenceLabel, TokenSchema
 from app.services.confidence import classify_confidence, detect_forced_flags
 from app.services.storage import save_upload
@@ -20,6 +21,7 @@ from app.services.storage import save_upload
 @dataclass
 class OcrResult:
     document_id: str
+    page_id: str
     image_url: str
     tokens: list[TokenSchema]
     status: DocumentStatus
@@ -102,9 +104,9 @@ def _extract_tokens(image_path: str) -> list[dict]:
     return tokens
 
 
-def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> OcrResult:
+def run_ocr_for_page(document_id: str, page_id: str, image_path: str, image_url: str) -> OcrResult:
     Base.metadata.create_all(bind=engine)
-    logger.info("OCR start document_id=%s", document_id)
+    logger.info("OCR start document_id=%s page_id=%s", document_id, page_id)
     with get_session() as session:
         document = session.get(Document, document_id)
         if document is None:
@@ -113,12 +115,14 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
             logger.info("OCR canceled before start document_id=%s", document_id)
             return OcrResult(
                 document_id=document_id,
+                page_id=page_id,
                 image_url=image_url,
                 tokens=[],
                 status=DocumentStatus.canceled,
                 image_width=int(getattr(document, "image_width")),
                 image_height=int(getattr(document, "image_height")),
             )
+
     with Image.open(image_path) as image:
         image_width, image_height = image.size
 
@@ -128,13 +132,15 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
 
     with get_session() as session:
         document = session.get(Document, document_id)
-        if document is None:
+        page = session.get(DocumentPage, page_id)
+        if document is None or page is None:
             raise ValueError("document_not_found")
 
         if document.status == DocumentStatus.canceled.value:
             logger.info("OCR canceled after extraction document_id=%s", document_id)
             return OcrResult(
                 document_id=document_id,
+                page_id=page_id,
                 image_url=image_url,
                 tokens=[],
                 status=DocumentStatus.canceled,
@@ -142,16 +148,15 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
                 image_height=image_height,
             )
 
-        session.execute(Token.__table__.delete().where(Token.document_id == document_id))
+        session.execute(Token.__table__.delete().where(Token.page_id == page_id))
         session.execute(
-            Document.__table__.update()
-            .where(Document.id == document_id)
+            DocumentPage.__table__.update()
+            .where(DocumentPage.id == page_id)
             .values(
                 image_path=image_path,
                 image_width=image_width,
                 image_height=image_height,
                 status=DocumentStatus.ocr_done.value,
-                processing_task_id=None,
             )
         )
 
@@ -161,12 +166,13 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
             forced_review = confidence_label != TokenConfidenceLabel.trusted or len(flags) > 0
             bbox = raw["bbox"]
             token_id = (
-                f"{document_id}-l{raw['line_index']}-t{raw['token_index']}-{_bbox_hash(bbox)}"
+                f"{document_id}-p{page_id}-l{raw['line_index']}-t{raw['token_index']}-{_bbox_hash(bbox)}"
             )
 
             token = Token(
                 id=token_id,
                 document_id=document_id,
+                page_id=page_id,
                 line_index=raw["line_index"],
                 token_index=raw["token_index"],
                 text=raw["text"],
@@ -201,6 +207,7 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
             AuditLog(
                 id=uuid.uuid4().hex,
                 document_id=document_id,
+                page_id=page_id,
                 event_type="ocr_completed",
                 detail=json.dumps({"token_count": len(token_schemas)}),
             )
@@ -209,6 +216,7 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
 
     return OcrResult(
         document_id=document_id,
+        page_id=page_id,
         image_url=image_url,
         tokens=token_schemas,
         status=DocumentStatus.ocr_done,
@@ -220,7 +228,7 @@ def run_ocr_for_document(document_id: str, image_path: str, image_url: str) -> O
 async def run_ocr(file: UploadFile) -> OcrResult:
     Base.metadata.create_all(bind=engine)
     logger.info("OCR start filename=%s", file.filename)
-    document_id, image_path, image_url = save_upload(file)
+    document_id, image_path, image_url, pages = save_upload(file)
     with get_session() as session:
         session.add(
             Document(
@@ -230,9 +238,29 @@ async def run_ocr(file: UploadFile) -> OcrResult:
                 image_height=0,
                 status=DocumentStatus.processing.value,
                 structured_fields=json.dumps({}),
+                page_count=len(pages),
             )
         )
+        for page in pages:
+            session.add(
+                DocumentPage(
+                    id=uuid.uuid4().hex,
+                    document_id=document_id,
+                    page_index=page["page_index"],
+                    image_path=page["image_path"],
+                    image_width=0,
+                    image_height=0,
+                    status=DocumentStatus.processing.value,
+                )
+            )
         session.commit()
-
-    return run_ocr_for_document(document_id, image_path, image_url)
+    with get_session() as session:
+        page_id = session.execute(
+            select(DocumentPage.id)
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_index.asc())
+        ).scalars().first()
+    if not page_id:
+        raise ValueError("document_not_found")
+    return run_ocr_for_page(document_id, page_id, image_path, image_url)
 logger = logging.getLogger("vera.ocr")

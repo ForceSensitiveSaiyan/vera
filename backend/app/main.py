@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 import logging
 import time
@@ -10,18 +11,18 @@ import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, update
 from sqlalchemy import text as sql_text
 
 from app.services.storage import save_upload
-from app.services.validation import apply_corrections
-from app.services.summary import build_summary
-from app.services.ollama import list_models, pull_model
+from app.services.validation import apply_corrections, apply_page_corrections
+from app.services.summary import build_summary, build_page_summary
+from app.services.ollama import list_models, pull_model, stream_pull_model
 from app.schemas.documents import StructuredFieldsUpdateRequest, ValidateRequest
 from app.db.session import Base, engine, get_session
-from app.models.documents import AuditLog, Document
+from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
 from app.models.documents import Token
 from app.worker import celery_app
@@ -73,7 +74,7 @@ async def log_requests(request: Request, call_next):
 async def upload_document(file: UploadFile = File(...)):
     logger.info("Upload started filename=%s", file.filename)
     try:
-        document_id, image_path, image_url = save_upload(file)
+        document_id, image_path, image_url, pages = save_upload(file)
         with get_session() as session:
             session.add(
                 Document(
@@ -83,8 +84,21 @@ async def upload_document(file: UploadFile = File(...)):
                     image_height=0,
                     status=DocumentStatus.uploaded.value,
                     structured_fields=json.dumps({}),
+                    page_count=len(pages),
                 )
             )
+            for page in pages:
+                session.add(
+                    DocumentPage(
+                        id=uuid.uuid4().hex,
+                        document_id=document_id,
+                        page_index=page["page_index"],
+                        image_path=page["image_path"],
+                        image_width=0,
+                        image_height=0,
+                        status=DocumentStatus.uploaded.value,
+                    )
+                )
             session.commit()
         task_result = celery_app.send_task("vera.process_document", args=[document_id])
         with get_session() as session:
@@ -110,14 +124,34 @@ async def upload_document(file: UploadFile = File(...)):
         logger.exception("Upload failed")
         raise
     logger.info("Upload queued document_id=%s", document_id)
+    with get_session() as session:
+        page_rows = session.execute(
+            select(DocumentPage)
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_index.asc())
+        ).scalars().all()
+
+    page_payload = [
+        {
+            "page_id": page.id,
+            "page_index": int(getattr(page, "page_index")),
+            "image_url": f"/files/{os.path.basename(str(getattr(page, 'image_path')))}",
+            "status": page.status,
+            "review_complete": bool(getattr(page, "review_complete_at")),
+        }
+        for page in page_rows
+    ]
+
     payload = {
         "document_id": document_id,
         "image_url": image_url,
         "image_width": 0,
         "image_height": 0,
         "status": DocumentStatus.uploaded.value,
-        "tokens": [],
+        "page_count": len(page_payload),
+        "pages": page_payload,
         "structured_fields": {},
+        "review_complete": False,
     }
     return JSONResponse(jsonable_encoder(payload))
 
@@ -152,6 +186,42 @@ async def validate_document(document_id: str, payload: ValidateRequest):
     )
 
 
+@app.post("/documents/{document_id}/pages/{page_id}/validate")
+async def validate_document_page(document_id: str, page_id: str, payload: ValidateRequest):
+    logger.info(
+        "Validate page started document_id=%s page_id=%s review_complete=%s",
+        document_id,
+        page_id,
+        payload.review_complete,
+    )
+    try:
+        validated_text, status, validated_at = apply_page_corrections(
+            document_id,
+            page_id,
+            [item.model_dump() for item in payload.corrections],
+            payload.reviewed_token_ids,
+            payload.review_complete,
+            payload.structured_fields,
+        )
+    except ValueError as error:
+        if str(error) == "document_not_found":
+            raise HTTPException(status_code=404, detail="Document not found")
+        if str(error) == "review_incomplete":
+            raise HTTPException(status_code=409, detail="Review incomplete")
+        raise
+    logger.info("Validate page completed document_id=%s page_id=%s status=%s", document_id, page_id, status)
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "validated_text": validated_text,
+                "validation_status": status,
+                "validated_at": validated_at,
+                "structured_fields": payload.structured_fields or {},
+            }
+        )
+    )
+
+
 @app.get("/documents/{document_id}")
 async def get_document(document_id: str):
     logger.debug("Get document document_id=%s", document_id)
@@ -159,15 +229,57 @@ async def get_document(document_id: str):
         document = session.get(Document, document_id)
         if document is None:
             raise HTTPException(status_code=404, detail="Document not found")
+        structured_fields_raw = getattr(document, "structured_fields")
+        structured_fields = json.loads(str(structured_fields_raw)) if structured_fields_raw else {}
+
+        pages = session.execute(
+            select(DocumentPage)
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_index.asc())
+        ).scalars().all()
+        page_payload = [
+            {
+                "page_id": page.id,
+                "page_index": int(getattr(page, "page_index")),
+                "image_url": f"/files/{os.path.basename(str(getattr(page, 'image_path')))}",
+                "image_width": int(getattr(page, "image_width")),
+                "image_height": int(getattr(page, "image_height")),
+                "status": page.status,
+                "review_complete": bool(getattr(page, "review_complete_at")),
+            }
+            for page in pages
+        ]
+
+        return JSONResponse(
+            {
+                "document_id": document.id,
+                "image_url": f"/files/{os.path.basename(str(getattr(document, 'image_path')))}",
+                "image_width": int(getattr(document, "image_width")),
+                "image_height": int(getattr(document, "image_height")),
+                "status": document.status,
+                "page_count": int(getattr(document, "page_count")),
+                "pages": page_payload,
+                "structured_fields": structured_fields,
+                "review_complete": bool(getattr(document, "review_complete_at")),
+            }
+        )
+
+
+@app.get("/documents/{document_id}/pages/{page_id}")
+async def get_document_page(document_id: str, page_id: str):
+    logger.debug("Get document page document_id=%s page_id=%s", document_id, page_id)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        page = session.get(DocumentPage, page_id)
+        if document is None or page is None or page.document_id != document_id:
+            raise HTTPException(status_code=404, detail="Document not found")
 
         tokens = session.execute(
             select(Token)
             .where(Token.document_id == document_id)
+            .where(Token.page_id == page_id)
             .order_by(Token.line_index.asc(), Token.token_index.asc())
         ).scalars().all()
-
-        structured_fields_raw = getattr(document, "structured_fields")
-        structured_fields = json.loads(str(structured_fields_raw)) if structured_fields_raw else {}
 
         token_payload = []
         for token in tokens:
@@ -193,12 +305,14 @@ async def get_document(document_id: str):
         return JSONResponse(
             {
                 "document_id": document.id,
-                "image_url": f"/files/{os.path.basename(str(getattr(document, 'image_path')))}",
-                "image_width": int(getattr(document, "image_width")),
-                "image_height": int(getattr(document, "image_height")),
-                "status": document.status,
+                "page_id": page.id,
+                "page_index": int(getattr(page, "page_index")),
+                "image_url": f"/files/{os.path.basename(str(getattr(page, 'image_path')))}",
+                "image_width": int(getattr(page, "image_width")),
+                "image_height": int(getattr(page, "image_height")),
+                "status": page.status,
+                "review_complete": bool(getattr(page, "review_complete_at")),
                 "tokens": token_payload,
-                "structured_fields": structured_fields,
             }
         )
 
@@ -232,6 +346,11 @@ async def cancel_document(document_id: str):
             .where(Document.id == document_id)
             .values(status=DocumentStatus.canceled.value, processing_task_id=None)
         )
+        session.execute(
+            update(DocumentPage)
+            .where(DocumentPage.document_id == document_id)
+            .values(status=DocumentStatus.canceled.value)
+        )
         session.add(
             AuditLog(
                 id=os.urandom(16).hex(),
@@ -257,6 +376,21 @@ async def get_summary(document_id: str, model: str | None = None):
             raise HTTPException(status_code=409, detail="Document not validated")
         raise
     logger.info("Summary completed document_id=%s", document_id)
+    return JSONResponse(summary)
+
+
+@app.get("/documents/{document_id}/pages/{page_id}/summary")
+async def get_page_summary(document_id: str, page_id: str, model: str | None = None):
+    logger.info("Summary requested document_id=%s page_id=%s", document_id, page_id)
+    try:
+        summary = build_page_summary(document_id, page_id, model_override=model)
+    except ValueError as error:
+        if str(error) == "document_not_found":
+            raise HTTPException(status_code=404, detail="Document not found")
+        if str(error) == "page_not_validated":
+            raise HTTPException(status_code=409, detail="Review incomplete")
+        raise
+    logger.info("Page summary completed document_id=%s page_id=%s", document_id, page_id)
     return JSONResponse(summary)
 
 
@@ -288,6 +422,22 @@ async def pull_llm_model(payload: dict):
     except httpx.HTTPError:
         raise HTTPException(status_code=503, detail="Failed to pull model from Ollama")
     return JSONResponse({"status": "ok", "result": result})
+
+
+@app.post("/llm/models/pull/stream")
+async def pull_llm_model_stream(payload: dict):
+    model = str(payload.get("model", "")).strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="Model name is required")
+
+    def event_stream():
+        try:
+            for event in stream_pull_model(model):
+                yield json.dumps(event) + "\n"
+        except httpx.HTTPError:
+            yield json.dumps({"error": "Failed to pull model from Ollama"}) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @app.post("/documents/{document_id}/fields")
@@ -388,6 +538,60 @@ async def export_document(document_id: str, format: str = "json"):
     if format.lower() == "csv":
         lines = ["key,value"]
         lines.append(f"document_id,{payload['document_id']}")
+        cleaned_text = payload["validated_text"].replace("\n", " ")
+        lines.append(f"validated_text,{cleaned_text}")
+        for key, value in payload["structured_fields"].items():
+            lines.append(f"{key},{value}")
+        return PlainTextResponse("\n".join(lines), media_type="text/csv")
+
+    return JSONResponse(payload)
+
+
+@app.get("/documents/{document_id}/pages/{page_id}/export")
+async def export_document_page(document_id: str, page_id: str, format: str = "json"):
+    logger.info("Export requested document_id=%s page_id=%s format=%s", document_id, page_id, format)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        page = session.get(DocumentPage, page_id)
+        if document is None or page is None or page.document_id != document_id:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if page.status not in (DocumentStatus.validated.value, DocumentStatus.summarized.value):
+            raise HTTPException(status_code=409, detail="Review incomplete")
+
+        validated_text = page.validated_text if page.validated_text is not None else ""
+        structured_fields_raw = getattr(page, "structured_fields")
+        structured_fields = json.loads(str(structured_fields_raw)) if structured_fields_raw else {}
+
+        session.execute(
+            update(DocumentPage)
+            .where(DocumentPage.id == page_id)
+            .values(status=DocumentStatus.exported.value)
+        )
+        session.add(
+            AuditLog(
+                id=os.urandom(16).hex(),
+                document_id=document_id,
+                page_id=page_id,
+                event_type="exported",
+                detail=json.dumps({"format": format.lower(), "scope": "page"}),
+            )
+        )
+        session.commit()
+
+        payload = {
+            "document_id": document_id,
+            "page_id": page_id,
+            "validated_text": validated_text,
+            "structured_fields": structured_fields,
+        }
+
+    if format.lower() == "txt":
+        return PlainTextResponse(validated_text, media_type="text/plain")
+
+    if format.lower() == "csv":
+        lines = ["key,value"]
+        lines.append(f"document_id,{payload['document_id']}")
+        lines.append(f"page_id,{payload['page_id']}")
         cleaned_text = payload["validated_text"].replace("\n", " ")
         lines.append(f"validated_text,{cleaned_text}")
         for key, value in payload["structured_fields"].items():

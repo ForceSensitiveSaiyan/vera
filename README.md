@@ -3,7 +3,7 @@
 VERA is a verification-first OCR application that extracts text from document images and PDFs, highlights low-confidence interpretations, lets users confirm corrections, and produces trustworthy summaries and structured output.
 
 ## v1 Scope
-- Inputs: JPG, PNG, PDF
+- Inputs: JPG, PNG, PDF (multi-page supported)
 - Target documents: receipts, invoices, general business documents
 - Language: English only
 
@@ -15,6 +15,9 @@ VERA is a verification-first OCR application that extracts text from document im
 
 ## Document Lifecycle
 `uploaded -> ocr_done -> review_in_progress -> validated -> summarized -> exported (or canceled)`
+
+For multi-page PDFs, each page is reviewed independently. Page summaries/exports unlock per-page,
+while document summaries/exports require all pages to be reviewed.
 
 Validation is a hard gate. Summaries and exports are only available after explicit review completion.
 
@@ -47,6 +50,7 @@ to avoid `DuplicateTable` errors:
 ## Notes
 - PDF support requires Poppler (Docker image installs it automatically).
 - Summaries and exports are gated behind explicit review completion.
+- Page summaries/exports are available once that page is reviewed; document summary/export requires all pages.
 - AI summaries use Ollama only when enabled in Settings; failures do not fallback to offline summaries.
 
 ## Optional LLM summaries (Ollama)

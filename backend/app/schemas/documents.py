@@ -36,13 +36,26 @@ class TokenSchema(BaseModel):
     flags: list[str]
 
 
+class PageSchema(BaseModel):
+    page_id: str
+    page_index: int
+    image_url: str
+    image_width: int | None = None
+    image_height: int | None = None
+    status: DocumentStatus
+    review_complete: bool = False
+
+
 class UploadResponse(BaseModel):
     document_id: str
     image_url: str
     image_width: int
     image_height: int
     status: DocumentStatus
-    tokens: list[TokenSchema]
+    page_count: int
+    pages: list[PageSchema]
+    structured_fields: dict[str, str] = Field(default_factory=dict)
+    review_complete: bool = False
 
 
 class CorrectionSchema(BaseModel):

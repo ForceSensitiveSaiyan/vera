@@ -10,36 +10,12 @@ import httpx
 from sqlalchemy import select, update
 
 from app.db.session import Base, engine, get_session
-from app.models.documents import AuditLog, Document
+from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
 
 
 
-def build_summary(document_id: str, model_override: str | None = None) -> dict:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Build summary document_id=%s", document_id)
-    with get_session() as session:
-        document = session.get(Document, document_id)
-        if document is None:
-            raise ValueError("document_not_found")
-        document_status = session.execute(
-            select(Document.status).where(Document.id == document_id)
-        ).scalar_one()
-        if document_status != DocumentStatus.validated.value:
-            raise ValueError("document_not_validated")
-
-        validated_text = session.execute(
-            select(Document.validated_text).where(Document.id == document_id)
-        ).scalar_one()
-        validated_text = validated_text if validated_text is not None else ""
-
-        session.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(status=DocumentStatus.summarized.value)
-        )
-        session.commit()
-
+def _build_summary_from_text(validated_text: str, model_override: str | None = None) -> tuple[list[str], dict[str, str]]:
     lines = [line.strip() for line in validated_text.splitlines() if line.strip()]
 
     line_count = len(lines)
@@ -116,7 +92,7 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
     def extract_amounts_from_line(line: str, allow_plain: bool) -> list[str]:
         values = [match.group(0) for match in currency_symbol_pattern.finditer(line)]
         values += [match.group(0) for match in currency_code_pattern.finditer(line)]
-        if allow_plain:
+        if allow_plain and not values:
             values += [match.group(0) for match in number_amount_pattern.finditer(line)]
         return values
 
@@ -154,7 +130,7 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
     )
     email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
     phone_pattern = re.compile(
-        r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{4}\b"
+        r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{4}"
     )
 
     invoice_numbers: list[str] = []
@@ -167,6 +143,7 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
     seen_phone = set()
 
     for line in lines:
+        normalized_line = line.lower()
         for match in invoice_pattern.findall(line):
             value = match.strip()
             if value and value not in seen_invoice:
@@ -183,6 +160,8 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
                 emails.append(match)
         for match in phone_pattern.findall(line):
             value = match.strip()
+            if value.isdigit() and any(term in normalized_line for term in ("vat", "tax", "id")):
+                continue
             if value and value not in seen_phone:
                 seen_phone.add(value)
                 phones.append(value)
@@ -398,6 +377,36 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
         "keywords": keyword_text,
     }
 
+    return bullet_summary, structured_fields
+
+
+def build_summary(document_id: str, model_override: str | None = None) -> dict:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Build summary document_id=%s", document_id)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        if document is None:
+            raise ValueError("document_not_found")
+        document_status = session.execute(
+            select(Document.status).where(Document.id == document_id)
+        ).scalar_one()
+        if document_status not in (DocumentStatus.validated.value, DocumentStatus.summarized.value):
+            raise ValueError("document_not_validated")
+
+        validated_text = session.execute(
+            select(Document.validated_text).where(Document.id == document_id)
+        ).scalar_one()
+        validated_text = validated_text if validated_text is not None else ""
+
+        session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(status=DocumentStatus.summarized.value)
+        )
+        session.commit()
+
+    bullet_summary, structured_fields = _build_summary_from_text(validated_text, model_override)
+
     with get_session() as session:
         session.execute(
             update(Document)
@@ -408,6 +417,50 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
             AuditLog(
                 id=uuid.uuid4().hex,
                 document_id=document_id,
+                event_type="summary_generated",
+                detail=json.dumps({"field_count": len(structured_fields)}),
+            )
+        )
+        session.commit()
+
+    return {
+        "bullet_summary": bullet_summary,
+        "structured_fields": structured_fields,
+        "validation_status": DocumentStatus.validated,
+    }
+
+
+def build_page_summary(document_id: str, page_id: str, model_override: str | None = None) -> dict:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Build summary document_id=%s page_id=%s", document_id, page_id)
+    with get_session() as session:
+        page = session.get(DocumentPage, page_id)
+        if page is None or page.document_id != document_id:
+            raise ValueError("document_not_found")
+        if page.status not in (DocumentStatus.validated.value, DocumentStatus.summarized.value):
+            raise ValueError("page_not_validated")
+
+        validated_text = page.validated_text or ""
+        session.execute(
+            update(DocumentPage)
+            .where(DocumentPage.id == page_id)
+            .values(status=DocumentStatus.summarized.value)
+        )
+        session.commit()
+
+    bullet_summary, structured_fields = _build_summary_from_text(validated_text, model_override)
+
+    with get_session() as session:
+        session.execute(
+            update(DocumentPage)
+            .where(DocumentPage.id == page_id)
+            .values(structured_fields=json.dumps(structured_fields))
+        )
+        session.add(
+            AuditLog(
+                id=uuid.uuid4().hex,
+                document_id=document_id,
+                page_id=page_id,
                 event_type="summary_generated",
                 detail=json.dumps({"field_count": len(structured_fields)}),
             )

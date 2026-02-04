@@ -17,6 +17,25 @@ class Document(Base):
     processing_task_id = Column(String, nullable=True)
     validated_text = Column(Text, nullable=True)
     structured_fields = Column(Text, nullable=False, default="{}")
+    page_count = Column(Integer, nullable=False, default=1)
+    review_complete_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class DocumentPage(Base):
+    __tablename__ = "document_pages"
+
+    id = Column(String, primary_key=True, index=True)
+    document_id = Column(String, ForeignKey("documents.id"), index=True, nullable=False)
+    page_index = Column(Integer, nullable=False)
+    image_path = Column(String, nullable=False)
+    image_width = Column(Integer, nullable=False)
+    image_height = Column(Integer, nullable=False)
+    status = Column(String, nullable=False)
+    validated_text = Column(Text, nullable=True)
+    structured_fields = Column(Text, nullable=False, default="{}")
+    review_complete_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -26,6 +45,7 @@ class Token(Base):
 
     id = Column(String, primary_key=True, index=True)
     document_id = Column(String, ForeignKey("documents.id"), index=True, nullable=False)
+    page_id = Column(String, ForeignKey("document_pages.id"), index=True, nullable=False)
     line_index = Column(Integer, nullable=False)
     token_index = Column(Integer, nullable=False)
     text = Column(Text, nullable=False)
@@ -42,6 +62,7 @@ class Correction(Base):
 
     id = Column(String, primary_key=True, index=True)
     document_id = Column(String, ForeignKey("documents.id"), index=True, nullable=False)
+    page_id = Column(String, ForeignKey("document_pages.id"), index=True, nullable=False)
     token_id = Column(String, ForeignKey("tokens.id"), index=True, nullable=False)
     original_text = Column(Text, nullable=False)
     corrected_text = Column(Text, nullable=False)
@@ -53,6 +74,7 @@ class AuditLog(Base):
 
     id = Column(String, primary_key=True, index=True)
     document_id = Column(String, ForeignKey("documents.id"), index=True, nullable=False)
+    page_id = Column(String, ForeignKey("document_pages.id"), index=True, nullable=True)
     event_type = Column(String, nullable=False)
     actor = Column(String, nullable=False, default="local_user")
     detail = Column(Text, nullable=False, default="{}")

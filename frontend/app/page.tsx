@@ -13,7 +13,29 @@ type DocumentPayload = {
   image_width: number;
   image_height: number;
   status: string;
+  page_count: number;
+  review_complete: boolean;
+  pages: Array<{
+    page_id: string;
+    page_index: number;
+    image_url: string;
+    image_width?: number;
+    image_height?: number;
+    status: string;
+    review_complete: boolean;
+  }>;
   structured_fields: Record<string, string>;
+};
+
+type PagePayload = {
+  document_id: string;
+  page_id: string;
+  page_index: number;
+  image_url: string;
+  image_width: number;
+  image_height: number;
+  status: string;
+  review_complete: boolean;
   tokens: Array<{
     id: string;
     line_id: string;
@@ -41,6 +63,40 @@ type ToastMessage = {
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
+const getResponseMessage = async (response: Response, fallback: string) => {
+  let detail = "";
+  let bodyText = "";
+  try {
+    bodyText = await response.text();
+  } catch {
+    bodyText = "";
+  }
+  if (bodyText) {
+    try {
+      const data = JSON.parse(bodyText) as { detail?: string };
+      if (typeof data.detail === "string") {
+        detail = data.detail;
+      }
+    } catch {
+      detail = bodyText;
+    }
+  }
+
+  if (response.status === 409 && detail === "Review incomplete") {
+    return "Please review all required tokens before generating the summary.";
+  }
+
+  if (response.status === 409 && detail === "Document not validated") {
+    return "Finish the review before generating a summary or export.";
+  }
+
+  if (response.status === 503 && detail === "Background worker is not available") {
+    return "The background worker isn't running. Start it and try again.";
+  }
+
+  return detail || fallback;
+};
+
 function severityScore(token: TokenBox) {
   if (token.confidenceLabel === "low") return 3;
   if (token.forcedReview) return 2;
@@ -49,10 +105,15 @@ function severityScore(token: TokenBox) {
 
 export default function HomePage() {
   const [selectedTokenId, setSelectedTokenId] = useState<string | null>(null);
-  const [corrections, setCorrections] = useState<Record<string, string>>({});
-  const [reviewedTokenIds, setReviewedTokenIds] = useState<Set<string>>(new Set());
   const [documentData, setDocumentData] = useState<DocumentPayload | null>(null);
-  const [summary, setSummary] = useState<SummaryPayload | null>(null);
+  const [pageData, setPageData] = useState<PagePayload | null>(null);
+  const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
+  const [correctionsByPage, setCorrectionsByPage] = useState<Record<string, Record<string, string>>>({});
+  const [reviewedTokenIdsByPage, setReviewedTokenIdsByPage] = useState<Record<string, Set<string>>>({});
+  const [pageSummaries, setPageSummaries] = useState<Record<string, SummaryPayload>>({});
+  const [pageSummarySources, setPageSummarySources] = useState<Record<string, "ai" | "offline">>({});
+  const [documentSummary, setDocumentSummary] = useState<SummaryPayload | null>(null);
+  const [documentSummarySource, setDocumentSummarySource] = useState<"ai" | "offline" | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,18 +124,41 @@ export default function HomePage() {
   const [selectedModel, setSelectedModel] = useState("llama3.1");
   const [aiEnabled, setAiEnabled] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [summarySource, setSummarySource] = useState<"ai" | "offline" | null>(null);
   const [ollamaHealth, setOllamaHealth] = useState<{ reachable: boolean } | null>(null);
   const [ollamaWarned, setOllamaWarned] = useState(false);
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const isProcessing = documentData ? ["uploaded", "processing"].includes(documentData.status) : false;
+  const [pageSummaryLoading, setPageSummaryLoading] = useState(false);
+  const [documentSummaryLoading, setDocumentSummaryLoading] = useState(false);
+  const isProcessing = documentData
+    ? documentData.pages.some((page) => ["uploaded", "processing"].includes(page.status))
+    : false;
   const processingActive = isProcessing && pollingEnabled;
   const interactionDisabled = loading || processingActive;
   const statusDotClass = isProcessing ? "status-indexing" : "status-ready";
 
+  const pageStatusClass = (status: string, reviewed: boolean) => {
+    if (reviewed) return "status-pill-ready";
+    if (status === "failed") return "status-pill-error";
+    if (status === "canceled") return "status-pill-paused";
+    if (["uploaded", "processing"].includes(status)) return "status-pill-processing";
+    return "status-pill-ready";
+  };
+
+  const activeCorrections = useMemo(() => {
+    if (!selectedPageId) return {};
+    return correctionsByPage[selectedPageId] ?? {};
+  }, [correctionsByPage, selectedPageId]);
+
+  const activeReviewedTokenIds = useMemo(() => {
+    if (!selectedPageId) return new Set<string>();
+    return reviewedTokenIdsByPage[selectedPageId] ?? new Set<string>();
+  }, [reviewedTokenIdsByPage, selectedPageId]);
+
+  const activePageSummary = selectedPageId ? pageSummaries[selectedPageId] ?? null : null;
+  const activePageSummarySource = selectedPageId ? pageSummarySources[selectedPageId] ?? null : null;
+
   const allTokens = useMemo<TokenBox[]>(() => {
-    if (!documentData) return [];
-    return documentData.tokens.map((token) => ({
+    if (!pageData) return [];
+    return pageData.tokens.map((token) => ({
       id: token.id,
       text: token.text,
       confidence: token.confidence,
@@ -83,7 +167,7 @@ export default function HomePage() {
       flags: token.flags,
       bbox: token.bbox,
     }));
-  }, [documentData]);
+  }, [pageData]);
 
   const flaggedTokens = useMemo(
     () =>
@@ -100,11 +184,19 @@ export default function HomePage() {
   }, [allTokens]);
 
   const selectedToken = flaggedTokens.find((token) => token.id === selectedTokenId) ?? null;
-  const correctionValue = selectedToken ? corrections[selectedToken.id] ?? selectedToken.text : "";
+  const correctionValue = selectedToken ? activeCorrections[selectedToken.id] ?? selectedToken.text : "";
   const displayTokens = showAllTokens ? allTokens : flaggedTokens;
 
-  const reviewedCount = flaggedTokens.filter((token) => reviewedTokenIds.has(token.id)).length;
+  const reviewedCount = flaggedTokens.filter((token) => activeReviewedTokenIds.has(token.id)).length;
   const reviewProgress = flaggedTokens.length ? Math.round((reviewedCount / flaggedTokens.length) * 100) : 0;
+  const reviewedPages = documentData ? documentData.pages.filter((page) => page.review_complete).length : 0;
+  const pageProgress = documentData?.pages.length ? Math.round((reviewedPages / documentData.pages.length) * 100) : 0;
+  const remainingCount = Math.max(flaggedTokens.length - reviewedCount, 0);
+  const selectedPageIndex = documentData
+    ? documentData.pages.findIndex((page) => page.page_id === selectedPageId)
+    : -1;
+  const currentPageNumber = selectedPageIndex >= 0 ? selectedPageIndex + 1 : 0;
+  const totalPages = documentData?.pages.length ?? 0;
 
   const pushToast = (message: string, variant: ToastMessage["variant"] = "error") => {
     const id =
@@ -121,9 +213,12 @@ export default function HomePage() {
     if (!file) return;
     setLoading(true);
     setError(null);
-    setSummary(null);
-    setSummarySource(null);
-    setSummaryLoading(false);
+    setPageSummaries({});
+    setPageSummarySources({});
+    setDocumentSummary(null);
+    setDocumentSummarySource(null);
+    setPageSummaryLoading(false);
+    setDocumentSummaryLoading(false);
     setPollingEnabled(true);
     setProcessingCanceled(false);
     try {
@@ -135,18 +230,32 @@ export default function HomePage() {
       });
 
       if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || "Upload failed");
+        const message = await getResponseMessage(response, "Upload failed");
+        throw new Error(message);
       }
 
       const data = (await response.json()) as DocumentPayload;
-      setDocumentData({
+      const pagesWithUrls = data.pages.map((page) => ({
+        ...page,
+        image_url: `${apiBase}${page.image_url}`,
+      }));
+      const nextDocument = {
         ...data,
         image_url: `${apiBase}${data.image_url}`,
-      });
-      setCorrections({});
-      setReviewedTokenIds(new Set());
+        pages: pagesWithUrls,
+      };
+      setDocumentData(nextDocument);
+      setCorrectionsByPage({});
+      setReviewedTokenIdsByPage({});
       setSelectedTokenId(null);
+      if (pagesWithUrls.length) {
+        const firstPageId = pagesWithUrls[0].page_id;
+        setSelectedPageId(firstPageId);
+        await fetchPage(nextDocument.document_id, firstPageId);
+      } else {
+        setSelectedPageId(null);
+        setPageData(null);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Upload failed";
       console.error("Upload failed", err);
@@ -157,6 +266,45 @@ export default function HomePage() {
     }
   };
 
+  const fetchPage = async (documentId: string, pageId: string) => {
+    try {
+      const response = await fetch(`${apiBase}/documents/${documentId}/pages/${pageId}`);
+      if (!response.ok) {
+        const message = await getResponseMessage(response, "Failed to load page");
+        throw new Error(message);
+      }
+      const data = (await response.json()) as PagePayload;
+      setPageData({
+        ...data,
+        image_url: `${apiBase}${data.image_url}`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load page";
+      console.error("Page fetch failed", err);
+      setError(message);
+      pushToast(message, "error");
+    }
+  };
+
+  const refreshDocument = async () => {
+    if (!documentData) return;
+    const response = await fetch(`${apiBase}/documents/${documentData.document_id}`);
+    if (!response.ok) {
+      const message = await getResponseMessage(response, "Failed to refresh document");
+      throw new Error(message);
+    }
+    const data = (await response.json()) as DocumentPayload;
+    const pagesWithUrls = data.pages.map((page) => ({
+      ...page,
+      image_url: `${apiBase}${page.image_url}`,
+    }));
+    setDocumentData({
+      ...data,
+      image_url: `${apiBase}${data.image_url}`,
+      pages: pagesWithUrls,
+    });
+  };
+
   useEffect(() => {
     if (!documentData || !processingActive) return;
     const interval = window.setInterval(async () => {
@@ -164,10 +312,21 @@ export default function HomePage() {
         const response = await fetch(`${apiBase}/documents/${documentData.document_id}`);
         if (!response.ok) return;
         const data = (await response.json()) as DocumentPayload;
+        const pagesWithUrls = data.pages.map((page) => ({
+          ...page,
+          image_url: `${apiBase}${page.image_url}`,
+        }));
         setDocumentData({
           ...data,
           image_url: `${apiBase}${data.image_url}`,
+          pages: pagesWithUrls,
         });
+        if (selectedPageId) {
+          const nextPage = pagesWithUrls.find((page) => page.page_id === selectedPageId);
+          if (nextPage && nextPage.status === "ocr_done" && pageData?.status !== "ocr_done") {
+            await fetchPage(documentData.document_id, selectedPageId);
+          }
+        }
         if (data.status === "failed") {
           setError("OCR processing failed. Please retry or upload a different document.");
           window.clearInterval(interval);
@@ -177,11 +336,22 @@ export default function HomePage() {
       }
     }, 1500);
     return () => window.clearInterval(interval);
-  }, [apiBase, documentData, processingActive]);
+  }, [apiBase, documentData, processingActive, selectedPageId, pageData]);
+
+  useEffect(() => {
+    if (selectedPageId || !documentData?.pages.length) return;
+    setSelectedPageId(documentData.pages[0].page_id);
+  }, [documentData, selectedPageId]);
+
+  useEffect(() => {
+    if (!documentData || !selectedPageId) return;
+    if (pageData?.page_id === selectedPageId) return;
+    fetchPage(documentData.document_id, selectedPageId);
+  }, [documentData, pageData?.page_id, selectedPageId]);
 
   const buildCorrectionsPayload = () => {
     const payload: Array<{ token_id: string; corrected_text: string }> = [];
-    Object.entries(corrections).forEach(([tokenId, value]) => {
+    Object.entries(activeCorrections).forEach(([tokenId, value]) => {
       const original = tokenById.get(tokenId)?.text;
       if (original !== undefined && value !== original) {
         payload.push({ token_id: tokenId, corrected_text: value });
@@ -191,7 +361,7 @@ export default function HomePage() {
   };
 
   const confirmReview = async () => {
-    if (!documentData) return;
+    if (!documentData || !pageData) return;
     if (aiEnabled && !selectedModel) {
       pushToast("Select a model before generating AI summaries.", "error");
       return;
@@ -199,24 +369,29 @@ export default function HomePage() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${apiBase}/documents/${documentData.document_id}/validate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          corrections: buildCorrectionsPayload(),
-          reviewed_token_ids: Array.from(reviewedTokenIds),
-          review_complete: true,
-        }),
-      });
+      const response = await fetch(
+        `${apiBase}/documents/${documentData.document_id}/pages/${pageData.page_id}/validate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            corrections: buildCorrectionsPayload(),
+            reviewed_token_ids: Array.from(activeReviewedTokenIds),
+            review_complete: true,
+          }),
+        }
+      );
 
       if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || "Validation failed");
+        const message = await getResponseMessage(response, "Validation failed");
+        throw new Error(message);
       }
 
-      setSummaryLoading(true);
+      setPageSummaryLoading(true);
       try {
-        await requestSummary();
+        await requestPageSummary();
+        await fetchPage(documentData.document_id, pageData.page_id);
+        await refreshDocument();
       } catch (err) {
         const message = err instanceof Error ? err.message : "Summary failed";
         console.error("Summary failed", err);
@@ -229,12 +404,32 @@ export default function HomePage() {
       setError(message);
       pushToast(message, "error");
     } finally {
-      setSummaryLoading(false);
+      setPageSummaryLoading(false);
       setLoading(false);
     }
   };
 
-  const requestSummary = async () => {
+  const requestPageSummary = async () => {
+    if (!documentData || !pageData) return;
+    const useAi = aiEnabled && selectedModel;
+    if (aiEnabled && !selectedModel) {
+      throw new Error("Select a model to generate AI summaries.");
+    }
+    const modelParam = useAi ? `?model=${encodeURIComponent(selectedModel)}` : "";
+    const summaryResponse = await fetch(
+      `${apiBase}/documents/${documentData.document_id}/pages/${pageData.page_id}/summary${modelParam}`
+    );
+    if (!summaryResponse.ok) {
+      const message = await getResponseMessage(summaryResponse, "Summary failed");
+      throw new Error(message);
+    }
+    const summaryData = (await summaryResponse.json()) as SummaryPayload;
+    const pageKey = selectedPageId ?? pageData.page_id;
+    setPageSummaries((prev) => ({ ...prev, [pageKey]: summaryData }));
+    setPageSummarySources((prev) => ({ ...prev, [pageKey]: useAi ? "ai" : "offline" }));
+  };
+
+  const requestDocumentSummary = async () => {
     if (!documentData) return;
     const useAi = aiEnabled && selectedModel;
     if (aiEnabled && !selectedModel) {
@@ -243,12 +438,12 @@ export default function HomePage() {
     const modelParam = useAi ? `?model=${encodeURIComponent(selectedModel)}` : "";
     const summaryResponse = await fetch(`${apiBase}/documents/${documentData.document_id}/summary${modelParam}`);
     if (!summaryResponse.ok) {
-      const message = await summaryResponse.text();
-      throw new Error(message || "Summary failed");
+      const message = await getResponseMessage(summaryResponse, "Summary failed");
+      throw new Error(message);
     }
     const summaryData = (await summaryResponse.json()) as SummaryPayload;
-    setSummary(summaryData);
-    setSummarySource(useAi ? "ai" : "offline");
+    setDocumentSummary(summaryData);
+    setDocumentSummarySource(useAi ? "ai" : "offline");
   };
 
   const exportDocument = async (format: "json" | "csv" | "txt") => {
@@ -258,8 +453,8 @@ export default function HomePage() {
     try {
       const response = await fetch(`${apiBase}/documents/${documentData.document_id}/export?format=${format}`);
       if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || "Export failed");
+        const message = await getResponseMessage(response, "Export failed");
+        throw new Error(message);
       }
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -280,21 +475,106 @@ export default function HomePage() {
     }
   };
 
-
-  const refreshSummary = async () => {
-    if (!summary || !documentData) return;
+  const exportPage = async (format: "json" | "csv" | "txt") => {
+    if (!documentData || !pageData) return;
     setLoading(true);
-    setSummaryLoading(true);
     setError(null);
     try {
-      await requestSummary();
+      const response = await fetch(
+        `${apiBase}/documents/${documentData.document_id}/pages/${pageData.page_id}/export?format=${format}`
+      );
+      if (!response.ok) {
+        const message = await getResponseMessage(response, "Export failed");
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `vera-export-page-${pageData.page_index + 1}.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Export failed";
+      console.error("Export failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  const refreshPageSummary = async () => {
+    if (!activePageSummary || !documentData || !pageData) return;
+    setLoading(true);
+    setPageSummaryLoading(true);
+    setError(null);
+    try {
+      await requestPageSummary();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Summary failed";
       console.error("Summary failed", err);
       setError(message);
       pushToast(message, "error");
     } finally {
-      setSummaryLoading(false);
+      setPageSummaryLoading(false);
+      setLoading(false);
+    }
+  };
+
+  const generatePageSummary = async () => {
+    if (!documentData || !pageData) return;
+    setLoading(true);
+    setPageSummaryLoading(true);
+    setError(null);
+    try {
+      await requestPageSummary();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Summary failed";
+      console.error("Summary failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setPageSummaryLoading(false);
+      setLoading(false);
+    }
+  };
+
+  const refreshDocumentSummary = async () => {
+    if (!documentSummary || !documentData) return;
+    setLoading(true);
+    setDocumentSummaryLoading(true);
+    setError(null);
+    try {
+      await requestDocumentSummary();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Summary failed";
+      console.error("Summary failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setDocumentSummaryLoading(false);
+      setLoading(false);
+    }
+  };
+
+  const generateDocumentSummary = async () => {
+    if (!documentData) return;
+    setLoading(true);
+    setDocumentSummaryLoading(true);
+    setError(null);
+    try {
+      await requestDocumentSummary();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Summary failed";
+      console.error("Summary failed", err);
+      setError(message);
+      pushToast(message, "error");
+    } finally {
+      setDocumentSummaryLoading(false);
       setLoading(false);
     }
   };
@@ -353,8 +633,8 @@ export default function HomePage() {
         method: "POST",
       });
       if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || "Cancel failed");
+        const message = await getResponseMessage(response, "Cancel failed");
+        throw new Error(message);
       }
       const data = (await response.json()) as { status: string };
       setDocumentData((prev) =>
@@ -362,6 +642,7 @@ export default function HomePage() {
           ? {
               ...prev,
               status: data.status,
+              pages: prev.pages.map((page) => ({ ...page, status: data.status })),
             }
           : prev
       );
@@ -383,31 +664,53 @@ export default function HomePage() {
   };
 
   const handleMarkReviewed = () => {
-    if (!selectedToken || interactionDisabled) return;
-    setReviewedTokenIds((prev) => {
-      const next = new Set(prev);
-      next.add(selectedToken.id);
-      setSelectedTokenId(findNextTokenId(selectedToken.id, next));
+    if (!selectedToken || interactionDisabled || !selectedPageId) return;
+    setReviewedTokenIdsByPage((prev) => {
+      const next = { ...prev };
+      const current = new Set(next[selectedPageId] ?? []);
+      current.add(selectedToken.id);
+      next[selectedPageId] = current;
+      setSelectedTokenId(findNextTokenId(selectedToken.id, current));
       return next;
     });
   };
 
   const handleUnmarkReviewed = () => {
-    if (!selectedToken || interactionDisabled) return;
-    setReviewedTokenIds((prev) => {
-      const next = new Set(prev);
-      next.delete(selectedToken.id);
+    if (!selectedToken || interactionDisabled || !selectedPageId) return;
+    setReviewedTokenIdsByPage((prev) => {
+      const next = { ...prev };
+      const current = new Set(next[selectedPageId] ?? []);
+      current.delete(selectedToken.id);
+      next[selectedPageId] = current;
       return next;
     });
   };
 
   const handleRevert = () => {
-    if (!selectedToken || interactionDisabled) return;
-    setCorrections((prev) => {
+    if (!selectedToken || interactionDisabled || !selectedPageId) return;
+    setCorrectionsByPage((prev) => {
       const next = { ...prev };
-      delete next[selectedToken.id];
+      const pageCorrections = { ...(next[selectedPageId] ?? {}) };
+      delete pageCorrections[selectedToken.id];
+      next[selectedPageId] = pageCorrections;
       return next;
     });
+  };
+
+  const jumpToNextUnreviewed = () => {
+    if (!flaggedTokens.length || interactionDisabled) return;
+    const unreviewed = flaggedTokens.find((token) => !activeReviewedTokenIds.has(token.id));
+    if (!unreviewed) return;
+    setSelectedTokenId(unreviewed.id);
+  };
+
+  const goToPage = async (nextIndex: number) => {
+    if (!documentData) return;
+    const nextPage = documentData.pages[nextIndex];
+    if (!nextPage) return;
+    setSelectedPageId(nextPage.page_id);
+    setSelectedTokenId(null);
+    await fetchPage(documentData.document_id, nextPage.page_id);
   };
 
   return (
@@ -549,7 +852,7 @@ export default function HomePage() {
 
           <div className="vera-grid">
             <div className="vera-stack">
-              <div className="card">
+              <div className="card document-card">
                 <div className="card-header">
                   <div className="card-title">Document</div>
                   <div className="card-header-actions">
@@ -588,17 +891,92 @@ export default function HomePage() {
                     ) : null}
                   </div>
                 </div>
-                <div className="card-body">
+                <div className="card-body document-card-body">
                   {documentData ? (
-                    <ImageOverlay
-                      imageUrl={documentData.image_url}
-                      imageWidth={documentData.image_width}
-                      imageHeight={documentData.image_height}
-                      tokens={displayTokens}
-                      selectedTokenId={selectedTokenId}
-                      onSelect={setSelectedTokenId}
-                      disabled={interactionDisabled}
-                    />
+                    <div className="vera-stack">
+                      {totalPages > 1 ? (
+                        <>
+                          <div className="page-toolbar">
+                            <div className="page-indicator">
+                              Page {currentPageNumber || 1} of {totalPages || 1}
+                            </div>
+                            <div className="page-actions">
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => goToPage(Math.max(selectedPageIndex - 1, 0))}
+                                disabled={interactionDisabled || selectedPageIndex <= 0}
+                              >
+                                Previous
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => goToPage(Math.min(selectedPageIndex + 1, totalPages - 1))}
+                                disabled={interactionDisabled || selectedPageIndex < 0 || selectedPageIndex >= totalPages - 1}
+                              >
+                                Next
+                              </button>
+                            </div>
+                          </div>
+                          <div className="page-strip" role="tablist" aria-label="Document pages">
+                            {documentData.pages.map((page) => (
+                              <button
+                                key={page.page_id}
+                                type="button"
+                                role="tab"
+                                aria-selected={page.page_id === selectedPageId}
+                                className={`page-thumb${page.page_id === selectedPageId ? " is-active" : ""}`}
+                                onClick={async () => {
+                                  setSelectedPageId(page.page_id);
+                                  setSelectedTokenId(null);
+                                  await fetchPage(documentData.document_id, page.page_id);
+                                }}
+                                disabled={interactionDisabled}
+                              >
+                                <img src={page.image_url} alt={`Page ${page.page_index + 1}`} />
+                                <span className="page-thumb-label">Page {page.page_index + 1}</span>
+                                <span
+                                  className={`page-thumb-status status-pill ${pageStatusClass(
+                                    page.status,
+                                    page.review_complete
+                                  )}`}
+                                >
+                                  {page.review_complete
+                                    ? "Reviewed"
+                                    : page.status === "ocr_done"
+                                    ? "Ready"
+                                    : page.status === "failed"
+                                    ? "Failed"
+                                    : page.status === "canceled"
+                                    ? "Canceled"
+                                    : "Processing"}
+                                </span>
+                                {['uploaded', 'processing'].includes(page.status) ? (
+                                  <span className="page-thumb-progress" aria-hidden="true" />
+                                ) : null}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      ) : null}
+                      {pageData ? (
+                        <ImageOverlay
+                          imageUrl={pageData.image_url}
+                          imageWidth={pageData.image_width}
+                          imageHeight={pageData.image_height}
+                          tokens={displayTokens}
+                          selectedTokenId={selectedTokenId}
+                          onSelect={setSelectedTokenId}
+                          disabled={interactionDisabled}
+                        />
+                      ) : (
+                        <div className="upload-zone">
+                          <div className="upload-text">Loading page…</div>
+                          <div className="upload-hint">Fetching tokens and image data.</div>
+                        </div>
+                      )}
+                    </div>
                   ) : (
                     <div className="upload-zone">
                       <div className="upload-text">Drop a file to begin</div>
@@ -610,17 +988,27 @@ export default function HomePage() {
 
               <div className="card">
                 <div className="card-header">
-                  <div className="card-title">Summary</div>
+                  <div className="card-title">Page summary</div>
                   <div className="card-header-actions">
-                    {summarySource ? (
-                      <span className={`summary-badge summary-badge-${summarySource}`}>
-                        {summarySource === "ai" ? "AI" : "Offline"}
+                    {activePageSummarySource ? (
+                      <span className={`summary-badge summary-badge-${activePageSummarySource}`}>
+                        {activePageSummarySource === "ai" ? "AI" : "Offline"}
                       </span>
                     ) : null}
-                    {summary ? (
+                    {!activePageSummary && pageData?.review_complete ? (
                       <button
                         type="button"
-                        onClick={refreshSummary}
+                        onClick={generatePageSummary}
+                        disabled={interactionDisabled}
+                        className="btn btn-secondary btn-sm"
+                      >
+                        Generate
+                      </button>
+                    ) : null}
+                    {activePageSummary ? (
+                      <button
+                        type="button"
+                        onClick={refreshPageSummary}
                         disabled={interactionDisabled}
                         className="btn btn-secondary btn-sm"
                       >
@@ -630,10 +1018,10 @@ export default function HomePage() {
                   </div>
                 </div>
                 <div className="card-body">
-                  {summaryLoading ? (
+                  {pageSummaryLoading ? (
                     <div className="processing-banner" role="status" aria-live="polite">
                       <div className="processing-info">
-                        <div className="processing-title">Generating text</div>
+                        <div className="processing-title">Generating page summary</div>
                         <div className="processing-subtitle">
                           {aiEnabled ? "Waiting for Ollama response." : "Compiling summary."}
                         </div>
@@ -643,25 +1031,98 @@ export default function HomePage() {
                       </div>
                     </div>
                   ) : null}
+                  {pageData && !pageData.review_complete ? (
+                    <div className="summary-review-note">Complete this page review to generate its summary.</div>
+                  ) : null}
                   <SummaryView
-                    bulletSummary={summary?.bullet_summary ?? []}
-                    structuredFields={summary?.structured_fields}
+                    bulletSummary={activePageSummary?.bullet_summary ?? []}
+                    structuredFields={activePageSummary?.structured_fields}
                   />
                 </div>
               </div>
+
+              {totalPages > 1 ? (
+                <div className="card">
+                  <div className="card-header">
+                    <div className="card-title">Document summary</div>
+                    <div className="card-header-actions">
+                      {documentSummarySource ? (
+                        <span className={`summary-badge summary-badge-${documentSummarySource}`}>
+                          {documentSummarySource === "ai" ? "AI" : "Offline"}
+                        </span>
+                      ) : null}
+                      {!documentSummary && documentData?.review_complete ? (
+                        <button
+                          type="button"
+                          onClick={generateDocumentSummary}
+                          disabled={interactionDisabled}
+                          className="btn btn-secondary btn-sm"
+                        >
+                          Generate
+                        </button>
+                      ) : null}
+                      {documentSummary ? (
+                        <button
+                          type="button"
+                          onClick={refreshDocumentSummary}
+                          disabled={interactionDisabled}
+                          className="btn btn-secondary btn-sm"
+                        >
+                          Regenerate
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="card-body">
+                    {documentSummaryLoading ? (
+                      <div className="processing-banner" role="status" aria-live="polite">
+                        <div className="processing-info">
+                          <div className="processing-title">Generating document summary</div>
+                          <div className="processing-subtitle">
+                            {aiEnabled ? "Waiting for Ollama response." : "Compiling summary."}
+                          </div>
+                        </div>
+                        <div className="processing-bar" aria-hidden="true">
+                          <div className="processing-bar-fill" />
+                        </div>
+                      </div>
+                    ) : null}
+                    {documentData && !documentData.review_complete ? (
+                      <div className="summary-review-note">Complete all pages to unlock the document summary.</div>
+                    ) : null}
+                    <SummaryView
+                      bulletSummary={documentSummary?.bullet_summary ?? []}
+                      structuredFields={documentSummary?.structured_fields}
+                    />
+                  </div>
+                </div>
+              ) : null}
             </div>
 
-            <aside className="vera-stack">
-              <div className="card">
+            <aside className="vera-stack review-column">
+              <div className="card review-card">
                 <div className="card-header">
                   <div className="card-title">Uncertain text</div>
                 </div>
-                <div className="card-body vera-stack">
-                  <div className="form-hint">
-                    {flaggedTokens.length} uncertain items · {reviewedCount} reviewed
+                <div className="card-body vera-stack review-card-body" aria-live="polite">
+                  <div className="review-metrics">
+                    <div className="form-hint">
+                      {flaggedTokens.length} uncertain items · {reviewedCount} reviewed · {remainingCount} remaining
+                    </div>
+                    <button
+                      type="button"
+                      onClick={jumpToNextUnreviewed}
+                      disabled={interactionDisabled || remainingCount === 0}
+                      className="btn btn-secondary btn-sm"
+                    >
+                      Jump to next
+                    </button>
                   </div>
                   <div className="progress-bar">
                     <div className="progress-fill" style={{ width: `${reviewProgress}%` }} />
+                  </div>
+                  <div className="form-hint">
+                    Pages reviewed: {reviewedPages}/{documentData?.pages.length ?? 0} · {pageProgress}% complete
                   </div>
                   <div className="form-hint">
                     Uncertain text is flagged for low confidence or forced review.
@@ -670,37 +1131,43 @@ export default function HomePage() {
                     tokens={flaggedTokens}
                     selectedTokenId={selectedTokenId}
                     onSelect={setSelectedTokenId}
-                    reviewedTokenIds={reviewedTokenIds}
+                    reviewedTokenIds={activeReviewedTokenIds}
                     disabled={interactionDisabled}
                   />
                 </div>
               </div>
 
-              <div className="card">
+              <div className="card review-card">
                 <div className="card-header">
                   <div className="card-title">Edit</div>
                 </div>
-                <div className="card-body vera-stack">
+                <div className="card-body vera-stack review-card-body">
                   <CorrectionEditor
                     token={selectedToken}
                     value={correctionValue}
                     onChange={(value) => {
-                      if (!selectedToken) return;
-                      setCorrections((prev) => ({ ...prev, [selectedToken.id]: value }));
+                      if (!selectedToken || !selectedPageId) return;
+                      setCorrectionsByPage((prev) => ({
+                        ...prev,
+                        [selectedPageId]: {
+                          ...(prev[selectedPageId] ?? {}),
+                          [selectedToken.id]: value,
+                        },
+                      }));
                     }}
                     onMarkReviewed={handleMarkReviewed}
                     onUnmarkReviewed={handleUnmarkReviewed}
                     onRevert={handleRevert}
                     disabled={interactionDisabled}
-                    isReviewed={selectedToken ? reviewedTokenIds.has(selectedToken.id) : false}
+                    isReviewed={selectedToken ? activeReviewedTokenIds.has(selectedToken.id) : false}
                   />
                   <button
                     type="button"
                     onClick={confirmReview}
-                    disabled={!documentData || interactionDisabled}
+                    disabled={!documentData || !pageData || interactionDisabled}
                     className="btn btn-primary"
                   >
-                    Confirm and generate summary
+                    Confirm page review & summary
                   </button>
                 </div>
               </div>
@@ -710,30 +1177,62 @@ export default function HomePage() {
                   <div className="card-title">Export</div>
                 </div>
                 <div className="card-body vera-stack">
-                  <button
-                    type="button"
-                    onClick={() => exportDocument("json")}
-                    disabled={!summary || interactionDisabled}
-                    className="btn btn-secondary"
-                  >
-                    Export JSON
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => exportDocument("csv")}
-                    disabled={!summary || interactionDisabled}
-                    className="btn btn-secondary"
-                  >
-                    Export CSV
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => exportDocument("txt")}
-                    disabled={!summary || interactionDisabled}
-                    className="btn btn-secondary"
-                  >
-                    Export TXT
-                  </button>
+                  <div className="summary-section">
+                    <div className="summary-heading">Page export</div>
+                    <button
+                      type="button"
+                      onClick={() => exportPage("json")}
+                      disabled={!pageData?.review_complete || interactionDisabled}
+                      className="btn btn-secondary"
+                    >
+                      Export page JSON
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportPage("csv")}
+                      disabled={!pageData?.review_complete || interactionDisabled}
+                      className="btn btn-secondary"
+                    >
+                      Export page CSV
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportPage("txt")}
+                      disabled={!pageData?.review_complete || interactionDisabled}
+                      className="btn btn-secondary"
+                    >
+                      Export page TXT
+                    </button>
+                  </div>
+                  {totalPages > 1 ? (
+                    <div className="summary-section">
+                      <div className="summary-heading">Document export</div>
+                      <button
+                        type="button"
+                        onClick={() => exportDocument("json")}
+                        disabled={!documentData?.review_complete || interactionDisabled}
+                        className="btn btn-secondary"
+                      >
+                        Export JSON
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => exportDocument("csv")}
+                        disabled={!documentData?.review_complete || interactionDisabled}
+                        className="btn btn-secondary"
+                      >
+                        Export CSV
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => exportDocument("txt")}
+                        disabled={!documentData?.review_complete || interactionDisabled}
+                        className="btn btn-secondary"
+                      >
+                        Export TXT
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </aside>
