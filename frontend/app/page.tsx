@@ -23,6 +23,7 @@ type DocumentPayload = {
     image_height?: number;
     status: string;
     review_complete: boolean;
+    version?: number;
   }>;
   structured_fields: Record<string, string>;
 };
@@ -36,6 +37,7 @@ type PagePayload = {
   image_height: number;
   status: string;
   review_complete: boolean;
+  version?: number;
   tokens: Array<{
     id: string;
     line_id: string;
@@ -48,6 +50,24 @@ type PagePayload = {
     bbox: [number, number, number, number];
     flags: string[];
   }>;
+};
+
+type PageStatusPayload = {
+  page_id: string;
+  page_index: number;
+  status: string;
+  review_complete: boolean;
+  token_count: number;
+  forced_review_count: number;
+  updated_at: string | null;
+  version: number;
+};
+
+type DocumentStatusPayload = {
+  document_id: string;
+  status: string;
+  review_complete: boolean;
+  pages: PageStatusPayload[];
 };
 
 type SummaryPayload = {
@@ -86,12 +106,24 @@ const getResponseMessage = async (response: Response, fallback: string) => {
     return "Please review all required tokens before generating the summary.";
   }
 
+  if (response.status === 409 && detail === "Review out of date") {
+    return "This page was updated elsewhere. Refresh and try again.";
+  }
+
   if (response.status === 409 && detail === "Document not validated") {
     return "Finish the review before generating a summary or export.";
   }
 
   if (response.status === 503 && detail === "Background worker is not available") {
     return "The background worker isn't running. Start it and try again.";
+  }
+
+  if (response.status === 413 && detail === "File exceeds upload size limit") {
+    return "The file is too large. Please upload a smaller document.";
+  }
+
+  if (response.status === 429) {
+    return "You're uploading too quickly. Please wait a moment and try again.";
   }
 
   return detail || fallback;
@@ -128,6 +160,7 @@ export default function HomePage() {
   const [ollamaWarned, setOllamaWarned] = useState(false);
   const [pageSummaryLoading, setPageSummaryLoading] = useState(false);
   const [documentSummaryLoading, setDocumentSummaryLoading] = useState(false);
+  const [statusStreamActive, setStatusStreamActive] = useState(false);
   const isProcessing = documentData
     ? documentData.pages.some((page) => ["uploaded", "processing"].includes(page.status))
     : false;
@@ -305,29 +338,71 @@ export default function HomePage() {
     });
   };
 
+  const applyStatusUpdate = (statusData: DocumentStatusPayload) => {
+    setDocumentData((prev) => {
+      if (!prev) return prev;
+      const pageMap = new Map(statusData.pages.map((page) => [page.page_id, page]));
+      const nextPages = prev.pages.map((page) => {
+        const update = pageMap.get(page.page_id);
+        if (!update) return page;
+        return {
+          ...page,
+          status: update.status,
+          review_complete: update.review_complete,
+          version: update.version ?? page.version,
+        };
+      });
+      return {
+        ...prev,
+        status: statusData.status ?? prev.status,
+        review_complete: statusData.review_complete ?? prev.review_complete,
+        pages: nextPages,
+      };
+    });
+
+    if (pageData) {
+      const update = statusData.pages.find((page) => page.page_id === pageData.page_id);
+      if (update) {
+        if (update.status === "ocr_done" && pageData.status !== "ocr_done" && documentData) {
+          void fetchPage(documentData.document_id, pageData.page_id);
+        }
+        setPageData((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: update.status,
+                review_complete: update.review_complete,
+                version: update.version ?? prev.version,
+              }
+            : prev
+        );
+      }
+    }
+  };
+
+  const fetchPageStatuses = async () => {
+    if (!documentData) return;
+    const response = await fetch(`${apiBase}/documents/${documentData.document_id}/pages/status`);
+    if (!response.ok) {
+      const message = await getResponseMessage(response, "Failed to load status");
+      throw new Error(message);
+    }
+    const statusData = (await response.json()) as DocumentStatusPayload;
+    applyStatusUpdate(statusData);
+    return statusData;
+  };
+
   useEffect(() => {
-    if (!documentData || !processingActive) return;
+    if (!documentData || !processingActive || statusStreamActive) return;
     const interval = window.setInterval(async () => {
       try {
-        const response = await fetch(`${apiBase}/documents/${documentData.document_id}`);
-        if (!response.ok) return;
-        const data = (await response.json()) as DocumentPayload;
-        const pagesWithUrls = data.pages.map((page) => ({
-          ...page,
-          image_url: `${apiBase}${page.image_url}`,
-        }));
-        setDocumentData({
-          ...data,
-          image_url: `${apiBase}${data.image_url}`,
-          pages: pagesWithUrls,
-        });
-        if (selectedPageId) {
-          const nextPage = pagesWithUrls.find((page) => page.page_id === selectedPageId);
-          if (nextPage && nextPage.status === "ocr_done" && pageData?.status !== "ocr_done") {
-            await fetchPage(documentData.document_id, selectedPageId);
-          }
+        const statusData = await fetchPageStatuses();
+        if (!statusData) return;
+        const nextPage = statusData.pages.find((page) => page.page_id === selectedPageId);
+        if (nextPage && nextPage.status === "ocr_done" && pageData?.status !== "ocr_done") {
+          await fetchPage(documentData.document_id, selectedPageId!);
         }
-        if (data.status === "failed") {
+        if (statusData.status === "failed") {
           setError("OCR processing failed. Please retry or upload a different document.");
           window.clearInterval(interval);
         }
@@ -336,7 +411,49 @@ export default function HomePage() {
       }
     }, 1500);
     return () => window.clearInterval(interval);
-  }, [apiBase, documentData, processingActive, selectedPageId, pageData]);
+  }, [apiBase, documentData, processingActive, selectedPageId, pageData, statusStreamActive]);
+
+  useEffect(() => {
+    if (!documentData || !pollingEnabled) return;
+    if (typeof window === "undefined" || !("EventSource" in window)) return;
+
+    const stream = new EventSource(`${apiBase}/documents/${documentData.document_id}/status/stream`);
+    const handleMessage = (event: MessageEvent) => {
+      try {
+        const payload = JSON.parse(event.data) as DocumentStatusPayload;
+        if ((payload as { error?: string }).error) {
+          return;
+        }
+        applyStatusUpdate(payload);
+        if (payload.status === "failed") {
+          setError("OCR processing failed. Please retry or upload a different document.");
+        }
+      } catch (err) {
+        console.error("Status stream parse failed", err);
+      }
+    };
+
+    const handleOpen = () => {
+      setStatusStreamActive(true);
+    };
+
+    const handleError = () => {
+      stream.close();
+      setStatusStreamActive(false);
+    };
+
+    stream.addEventListener("message", handleMessage);
+    stream.addEventListener("open", handleOpen);
+    stream.addEventListener("error", handleError);
+
+    return () => {
+      stream.removeEventListener("message", handleMessage);
+      stream.removeEventListener("open", handleOpen);
+      stream.removeEventListener("error", handleError);
+      stream.close();
+      setStatusStreamActive(false);
+    };
+  }, [apiBase, documentData, pollingEnabled]);
 
   useEffect(() => {
     if (selectedPageId || !documentData?.pages.length) return;
@@ -378,6 +495,7 @@ export default function HomePage() {
             corrections: buildCorrectionsPayload(),
             reviewed_token_ids: Array.from(activeReviewedTokenIds),
             review_complete: true,
+            page_version: pageData.version ?? null,
           }),
         }
       );
@@ -524,6 +642,21 @@ export default function HomePage() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!aiEnabled || !pageData?.review_complete) return;
+    if (pageSummaryLoading) return;
+    if (activePageSummarySource === "ai") return;
+    if (!selectedModel) return;
+    generatePageSummary();
+  }, [
+    aiEnabled,
+    pageData?.review_complete,
+    selectedPageId,
+    activePageSummarySource,
+    selectedModel,
+    pageSummaryLoading,
+  ]);
 
   const generatePageSummary = async () => {
     if (!documentData || !pageData) return;
@@ -1100,75 +1233,77 @@ export default function HomePage() {
             </div>
 
             <aside className="vera-stack review-column">
-              <div className="card review-card">
-                <div className="card-header">
-                  <div className="card-title">Uncertain text</div>
-                </div>
-                <div className="card-body vera-stack review-card-body" aria-live="polite">
-                  <div className="review-metrics">
-                    <div className="form-hint">
-                      {flaggedTokens.length} uncertain items · {reviewedCount} reviewed · {remainingCount} remaining
+              <div className="review-stack">
+                <div className="card review-card">
+                  <div className="card-header">
+                    <div className="card-title">Uncertain text</div>
+                  </div>
+                  <div className="card-body vera-stack review-card-body" aria-live="polite">
+                    <div className="review-metrics">
+                      <div className="form-hint">
+                        {flaggedTokens.length} uncertain items · {reviewedCount} reviewed · {remainingCount} remaining
+                      </div>
+                      <button
+                        type="button"
+                        onClick={jumpToNextUnreviewed}
+                        disabled={interactionDisabled || remainingCount === 0}
+                        className="btn btn-secondary btn-sm"
+                      >
+                        Jump to next
+                      </button>
                     </div>
+                    <div className="progress-bar">
+                      <div className="progress-fill" style={{ width: `${reviewProgress}%` }} />
+                    </div>
+                    <div className="form-hint">
+                      Pages reviewed: {reviewedPages}/{documentData?.pages.length ?? 0} · {pageProgress}% complete
+                    </div>
+                    <div className="form-hint">
+                      Uncertain text is flagged for low confidence or forced review.
+                    </div>
+                    <TokenList
+                      tokens={flaggedTokens}
+                      selectedTokenId={selectedTokenId}
+                      onSelect={setSelectedTokenId}
+                      reviewedTokenIds={activeReviewedTokenIds}
+                      disabled={interactionDisabled}
+                    />
+                  </div>
+                </div>
+
+                <div className="card review-card">
+                  <div className="card-header">
+                    <div className="card-title">Edit</div>
+                  </div>
+                  <div className="card-body vera-stack review-card-body">
+                    <CorrectionEditor
+                      token={selectedToken}
+                      value={correctionValue}
+                      onChange={(value) => {
+                        if (!selectedToken || !selectedPageId) return;
+                        setCorrectionsByPage((prev) => ({
+                          ...prev,
+                          [selectedPageId]: {
+                            ...(prev[selectedPageId] ?? {}),
+                            [selectedToken.id]: value,
+                          },
+                        }));
+                      }}
+                      onMarkReviewed={handleMarkReviewed}
+                      onUnmarkReviewed={handleUnmarkReviewed}
+                      onRevert={handleRevert}
+                      disabled={interactionDisabled}
+                      isReviewed={selectedToken ? activeReviewedTokenIds.has(selectedToken.id) : false}
+                    />
                     <button
                       type="button"
-                      onClick={jumpToNextUnreviewed}
-                      disabled={interactionDisabled || remainingCount === 0}
-                      className="btn btn-secondary btn-sm"
+                      onClick={confirmReview}
+                      disabled={!documentData || !pageData || interactionDisabled}
+                      className="btn btn-primary"
                     >
-                      Jump to next
+                      Confirm page review & summary
                     </button>
                   </div>
-                  <div className="progress-bar">
-                    <div className="progress-fill" style={{ width: `${reviewProgress}%` }} />
-                  </div>
-                  <div className="form-hint">
-                    Pages reviewed: {reviewedPages}/{documentData?.pages.length ?? 0} · {pageProgress}% complete
-                  </div>
-                  <div className="form-hint">
-                    Uncertain text is flagged for low confidence or forced review.
-                  </div>
-                  <TokenList
-                    tokens={flaggedTokens}
-                    selectedTokenId={selectedTokenId}
-                    onSelect={setSelectedTokenId}
-                    reviewedTokenIds={activeReviewedTokenIds}
-                    disabled={interactionDisabled}
-                  />
-                </div>
-              </div>
-
-              <div className="card review-card">
-                <div className="card-header">
-                  <div className="card-title">Edit</div>
-                </div>
-                <div className="card-body vera-stack review-card-body">
-                  <CorrectionEditor
-                    token={selectedToken}
-                    value={correctionValue}
-                    onChange={(value) => {
-                      if (!selectedToken || !selectedPageId) return;
-                      setCorrectionsByPage((prev) => ({
-                        ...prev,
-                        [selectedPageId]: {
-                          ...(prev[selectedPageId] ?? {}),
-                          [selectedToken.id]: value,
-                        },
-                      }));
-                    }}
-                    onMarkReviewed={handleMarkReviewed}
-                    onUnmarkReviewed={handleUnmarkReviewed}
-                    onRevert={handleRevert}
-                    disabled={interactionDisabled}
-                    isReviewed={selectedToken ? activeReviewedTokenIds.has(selectedToken.id) : false}
-                  />
-                  <button
-                    type="button"
-                    onClick={confirmReview}
-                    disabled={!documentData || !pageData || interactionDisabled}
-                    className="btn btn-primary"
-                  >
-                    Confirm page review & summary
-                  </button>
                 </div>
               </div>
 

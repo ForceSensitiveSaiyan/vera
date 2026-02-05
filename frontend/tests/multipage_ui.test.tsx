@@ -46,6 +46,7 @@ const pagePayload = (pageId: string, pageIndex: number) => ({
   image_height: 1600,
   status: "ocr_done",
   review_complete: false,
+  version: 1,
   tokens: [
     {
       id: `${pageId}-t1`,

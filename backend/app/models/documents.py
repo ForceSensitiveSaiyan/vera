@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
 
 from app.db.session import Base
+from app.utils.time import utcnow
 
 
 class Document(Base):
@@ -19,8 +19,11 @@ class Document(Base):
     structured_fields = Column(Text, nullable=False, default="{}")
     page_count = Column(Integer, nullable=False, default=1)
     review_complete_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    doc_type = Column(String, nullable=True)
+    locale = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class DocumentPage(Base):
@@ -36,8 +39,9 @@ class DocumentPage(Base):
     validated_text = Column(Text, nullable=True)
     structured_fields = Column(Text, nullable=False, default="{}")
     review_complete_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class Token(Base):
@@ -66,7 +70,7 @@ class Correction(Base):
     token_id = Column(String, ForeignKey("tokens.id"), index=True, nullable=False)
     original_text = Column(Text, nullable=False)
     corrected_text = Column(Text, nullable=False)
-    confirmed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    confirmed_at = Column(DateTime, default=utcnow, nullable=False)
 
 
 class AuditLog(Base):
@@ -78,4 +82,4 @@ class AuditLog(Base):
     event_type = Column(String, nullable=False)
     actor = Column(String, nullable=False, default="local_user")
     detail = Column(Text, nullable=False, default="{}")
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)

@@ -10,6 +10,7 @@ from fastapi import UploadFile
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 SUPPORTED_PDF_EXTENSIONS = {".pdf"}
+SUPPORTED_MIME_TYPES = {"image/jpeg", "image/png", "application/pdf"}
 logger = logging.getLogger("vera.storage")
 
 
@@ -24,6 +25,42 @@ class UploadLike(Protocol):
     file: BinaryIO
 
 
+def _get_file_size(file_obj: BinaryIO) -> int | None:
+    try:
+        current_pos = file_obj.tell()
+        file_obj.seek(0, os.SEEK_END)
+        size = file_obj.tell()
+        file_obj.seek(current_pos)
+        return size
+    except Exception:  # pragma: no cover
+        return None
+
+
+def _validate_mime(file_obj: BinaryIO) -> None:
+    try:
+        import filetype
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("mime_support_not_installed") from exc
+
+    current_pos = file_obj.tell()
+    file_obj.seek(0)
+    header = file_obj.read(261)
+    file_obj.seek(current_pos)
+
+    kind = filetype.guess(header)
+    if kind is None or kind.mime not in SUPPORTED_MIME_TYPES:
+        raise ValueError("unsupported_mime_type")
+
+
+def _run_virus_scan(path: str) -> None:
+    command = os.getenv("VIRUS_SCAN_COMMAND")
+    if not command:
+        return
+    result = os.system(f'{command} "{path}"')
+    if result != 0:
+        raise ValueError("virus_detected")
+
+
 def save_upload(file: UploadFile | UploadLike) -> tuple[str, str, str, list[dict]]:
     data_dir = ensure_data_dir()
     extension = os.path.splitext(file.filename or "")[-1].lower()
@@ -31,11 +68,25 @@ def save_upload(file: UploadFile | UploadLike) -> tuple[str, str, str, list[dict
     if extension not in SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_PDF_EXTENSIONS:
         logger.warning("Unsupported file type extension=%s", extension)
         raise ValueError("unsupported_file_type")
+
+    max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "25"))
+    file_size = _get_file_size(file.file)
+    if file_size is not None and file_size > max_upload_mb * 1024 * 1024:
+        raise ValueError("file_too_large")
+
+    if os.getenv("STRICT_MIME_VALIDATION", "1") == "1":
+        _validate_mime(file.file)
     document_id = uuid.uuid4().hex
     filename = f"{document_id}{extension}"
     original_path = os.path.join(data_dir, filename)
     with open(original_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    try:
+        _run_virus_scan(original_path)
+    except ValueError:
+        os.remove(original_path)
+        raise
 
     if extension in SUPPORTED_PDF_EXTENSIONS:
         try:

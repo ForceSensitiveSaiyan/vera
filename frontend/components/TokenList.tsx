@@ -20,7 +20,7 @@ export function TokenList({ tokens, selectedTokenId, onSelect, reviewedTokenIds,
             disabled={disabled}
           >
             <div className="token-title">
-              <span>{token.text || "(empty)"}</span>
+              <span className="token-text">{token.text || "(empty)"}</span>
               <span
                 className={`token-status ${reviewedTokenIds.has(token.id) ? "token-status-reviewed" : "token-status-pending"}`}
               >

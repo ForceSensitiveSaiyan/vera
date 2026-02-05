@@ -1,0 +1,11 @@
+{
+  "doc_type_keywords": {
+    "invoice": ["invoice", "inv", "bill", "amount due"],
+    "receipt": ["receipt", "pos", "transaction"],
+    "statement": ["statement", "balance", "account summary"]
+  },
+  "total_terms": ["total", "amount due", "balance due", "amount", "grand total", "total due"],
+  "subtotal_terms": ["subtotal", "sub total"],
+  "skip_terms": ["total", "subtotal", "tax", "amount due", "balance", "invoice", "receipt"],
+  "vendor_skip_terms": ["invoice", "receipt", "statement", "report", "form", "application"]
+}

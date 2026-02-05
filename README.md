@@ -51,7 +51,9 @@ to avoid `DuplicateTable` errors:
 - PDF support requires Poppler (Docker image installs it automatically).
 - Summaries and exports are gated behind explicit review completion.
 - Page summaries/exports are available once that page is reviewed; document summary/export requires all pages.
+- Document-level summary/export UI is only shown for multi-page documents.
 - AI summaries use Ollama only when enabled in Settings; failures do not fallback to offline summaries.
+- Uploads enforce file size and MIME validation; configure limits with `MAX_UPLOAD_MB` and `STRICT_MIME_VALIDATION`.
 
 ## Optional LLM summaries (Ollama)
 VERA can optionally call an Ollama instance to generate smart summary points. Toggle AI summaries from Settings in the UI.
@@ -67,6 +69,29 @@ a warning toast. AI mode does not fallback to offline summaries.
 
 If you run the backend in Docker but Ollama runs on your host, set `OLLAMA_URL=http://host.docker.internal:11434`.
 
+## Status streaming
+Document status updates are available via polling or Server-Sent Events:
+- `GET /documents/{id}/pages/status`
+- `GET /documents/{id}/status/stream`
+
+## Retention
+Set cleanup behavior with:
+- `RETENTION_DAYS` (default: 30)
+- `RETENTION_TRIGGER` (`post_export` or `post_review`)
+- `RETENTION_MODE` (`delete` or `archive`)
+- `RETENTION_ARCHIVE_DIR` (default: `./archive`)
+- `RETENTION_INTERVAL_MINUTES` (default: 1440)
+
+Run Celery beat to enable scheduled cleanup.
+
+## Observability
+- Request IDs are echoed in `X-Request-ID`.
+- Metrics exposed at `GET /metrics`.
+
+## Tests
+- Backend: `cd backend && pytest`
+- Frontend: `cd frontend && npm run test`
+
 ## Detected patterns
 The summary view extracts the following patterns when possible (amounts are normalized):
 - Dates (multiple formats)
@@ -75,3 +100,5 @@ The summary view extracts the following patterns when possible (amounts are norm
 - Emails
 - Phone numbers
 - Tax/VAT IDs
+
+Extraction rules can be customized via `EXTRACTION_RULES_PATH` (JSON) to tune document-type keywords and term lists.

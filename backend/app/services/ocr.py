@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -16,6 +17,7 @@ from app.models.documents import AuditLog, Document, DocumentPage, Token
 from app.schemas.documents import DocumentStatus, TokenConfidenceLabel, TokenSchema
 from app.services.confidence import classify_confidence, detect_forced_flags
 from app.services.storage import save_upload
+from app.utils.metrics import OCR_DURATION
 
 
 @dataclass
@@ -107,12 +109,14 @@ def _extract_tokens(image_path: str) -> list[dict]:
 def run_ocr_for_page(document_id: str, page_id: str, image_path: str, image_url: str) -> OcrResult:
     Base.metadata.create_all(bind=engine)
     logger.info("OCR start document_id=%s page_id=%s", document_id, page_id)
+    start_time = time.perf_counter()
     with get_session() as session:
         document = session.get(Document, document_id)
         if document is None:
             raise ValueError("document_not_found")
         if document.status == DocumentStatus.canceled.value:
             logger.info("OCR canceled before start document_id=%s", document_id)
+            OCR_DURATION.labels("canceled").observe(time.perf_counter() - start_time)
             return OcrResult(
                 document_id=document_id,
                 page_id=page_id,
@@ -138,6 +142,7 @@ def run_ocr_for_page(document_id: str, page_id: str, image_path: str, image_url:
 
         if document.status == DocumentStatus.canceled.value:
             logger.info("OCR canceled after extraction document_id=%s", document_id)
+            OCR_DURATION.labels("canceled").observe(time.perf_counter() - start_time)
             return OcrResult(
                 document_id=document_id,
                 page_id=page_id,
@@ -214,6 +219,7 @@ def run_ocr_for_page(document_id: str, page_id: str, image_path: str, image_url:
         )
         session.commit()
 
+    OCR_DURATION.labels("success").observe(time.perf_counter() - start_time)
     return OcrResult(
         document_id=document_id,
         page_id=page_id,

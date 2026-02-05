@@ -44,6 +44,7 @@ class PageSchema(BaseModel):
     image_height: int | None = None
     status: DocumentStatus
     review_complete: bool = False
+    version: int | None = None
 
 
 class UploadResponse(BaseModel):
@@ -68,6 +69,7 @@ class ValidateRequest(BaseModel):
     reviewed_token_ids: list[str] = Field(default_factory=list)
     review_complete: bool = False
     structured_fields: dict[str, str] | None = None
+    page_version: int | None = None
 
 
 class ValidateResponse(BaseModel):

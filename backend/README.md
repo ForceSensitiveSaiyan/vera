@@ -24,14 +24,39 @@ Use `docker compose exec backend alembic upgrade head` after first startup.
 - `POST /documents/{id}/validate`
 - `GET /documents/{id}/pages/{page_id}`
 - `POST /documents/{id}/pages/{page_id}/validate`
+- `GET /documents/{id}/pages/status`
+- `GET /documents/{id}/pages/{page_id}/status`
+- `GET /documents/{id}/status/stream`
 - `GET /documents/{id}/pages/{page_id}/summary`
 - `GET /documents/{id}/pages/{page_id}/export`
 - `GET /documents/{id}/summary`
 - `GET /documents/{id}/export`
+- `POST /llm/models/pull/stream`
 - `GET /health`
+- `GET /metrics`
 
 Validation requires an explicit `review_complete` flag before summaries or exports are available.
 Page summaries/exports are available once that page is reviewed; document summary/export requires all pages.
 
+## Security & limits
+- `MAX_UPLOAD_MB` (default: 25)
+- `STRICT_MIME_VALIDATION` (default: 1)
+- `UPLOAD_RATE_LIMIT` (default: `10/minute`)
+- Optional malware scan: set `VIRUS_SCAN_COMMAND` to a shell command that returns non-zero on failure.
+
+## Retention
+- `RETENTION_DAYS` (default: 30)
+- `RETENTION_TRIGGER` (`post_export` or `post_review`)
+- `RETENTION_MODE` (`delete` or `archive`)
+- `RETENTION_ARCHIVE_DIR` (default: `./archive`)
+- `RETENTION_INTERVAL_MINUTES` (default: 1440)
+
+## Summary extraction
+- `EXTRACTION_RULES_PATH` (default: `app/config/extraction_rules.json`)
+
 ## Document lifecycle
 `uploaded -> ocr_done -> review_in_progress -> validated -> summarized -> exported`
+
+## Tests
+Run from `backend/`:
+- `pytest`

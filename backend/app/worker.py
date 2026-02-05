@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 try:
     from celery import Celery
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
 from app.services.ocr import run_ocr_for_page
+from app.services.retention import cleanup_documents
 
 if Celery is None:  # pragma: no cover
     class _CeleryStub:
@@ -41,6 +43,16 @@ else:
         accept_content=["json"],
         task_track_started=True,
     )
+    cleanup_interval_minutes = int(os.getenv("RETENTION_INTERVAL_MINUTES", "1440"))
+    if cleanup_interval_minutes > 0:
+        celery_app.conf.update(
+            beat_schedule={
+                "vera.cleanup_documents": {
+                    "task": "vera.cleanup_documents",
+                    "schedule": timedelta(minutes=cleanup_interval_minutes),
+                }
+            }
+        )
 
 
 @celery_app.task(name="vera.process_document")
@@ -107,3 +119,8 @@ def process_document(document_id: str) -> dict[str, str]:
             )
             session.commit()
         raise
+
+
+@celery_app.task(name="vera.cleanup_documents")
+def cleanup_documents_task() -> dict[str, int | str]:
+    return cleanup_documents()

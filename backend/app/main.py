@@ -1,19 +1,25 @@
-from __future__ import annotations
-
 import json
 import os
 import uuid
 
+import asyncio
 import logging
 import time
 
 import httpx
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, update
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from sqlalchemy import case, func, select, update
 from sqlalchemy import text as sql_text
 
 from app.services.storage import save_upload
@@ -26,14 +32,47 @@ from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
 from app.models.documents import Token
 from app.worker import celery_app
+from app.utils.logging import RequestIdFilter
+from app.utils.request_id import set_request_id
+from app.utils.metrics import REQUEST_COUNT, REQUEST_LATENCY
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s [request_id=%(request_id)s] %(message)s",
 )
+
+
+def _attach_request_id_filter() -> None:
+    request_filter = RequestIdFilter()
+    root_logger = logging.getLogger()
+    root_logger.addFilter(request_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(request_filter)
+
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(logger_name)
+        logger.addFilter(request_filter)
+        for handler in logger.handlers:
+            handler.addFilter(request_filter)
+
+
+_attach_request_id_filter()
 logger = logging.getLogger("vera")
 
-app = FastAPI(title="VERA API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Startup: initializing database")
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(title="VERA API", version="0.1.0", lifespan=lifespan)
+
+upload_rate_limit = os.getenv("UPLOAD_RATE_LIMIT", "10/minute")
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
@@ -43,23 +82,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SlowAPIMiddleware)
 
 data_dir = os.getenv("DATA_DIR", "./data")
 app.mount("/files", StaticFiles(directory=data_dir), name="files")
 
 
-@app.on_event("startup")
-def startup_event():
-    logger.info("Startup: initializing database")
-    Base.metadata.create_all(bind=engine)
-
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
+    request_id = request.headers.get("x-request-id", uuid.uuid4().hex)
+    set_request_id(request_id)
     logger.debug("Request start %s %s", request.method, request.url.path)
     response = await call_next(request)
     duration_ms = (time.time() - start_time) * 1000
+    REQUEST_COUNT.labels(request.method, request.url.path, response.status_code).inc()
+    REQUEST_LATENCY.labels(request.method, request.url.path).observe(duration_ms / 1000)
     logger.debug(
         "Request end %s %s status=%s duration_ms=%.2f",
         request.method,
@@ -67,11 +105,13 @@ async def log_requests(request: Request, call_next):
         response.status_code,
         duration_ms,
     )
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
 @app.post("/documents/upload")
-async def upload_document(file: UploadFile = File(...)):
+@limiter.limit(upload_rate_limit)
+async def upload_document(request: Request, file: UploadFile = File(...)):
     logger.info("Upload started filename=%s", file.filename)
     try:
         document_id, image_path, image_url, pages = save_upload(file)
@@ -115,10 +155,18 @@ async def upload_document(file: UploadFile = File(...)):
             raise HTTPException(status_code=503, detail="PDF support is not installed")
         if str(error) == "pdf_no_pages":
             raise HTTPException(status_code=400, detail="PDF has no pages")
+        if str(error) == "mime_support_not_installed":
+            raise HTTPException(status_code=503, detail="MIME validation is not installed")
         raise
     except ValueError as error:
         if str(error) == "unsupported_file_type":
             raise HTTPException(status_code=415, detail="Unsupported file type")
+        if str(error) == "unsupported_mime_type":
+            raise HTTPException(status_code=415, detail="Unsupported MIME type")
+        if str(error) == "file_too_large":
+            raise HTTPException(status_code=413, detail="File exceeds upload size limit")
+        if str(error) == "virus_detected":
+            raise HTTPException(status_code=400, detail="File failed security scan")
         raise
     except Exception:
         logger.exception("Upload failed")
@@ -138,6 +186,7 @@ async def upload_document(file: UploadFile = File(...)):
             "image_url": f"/files/{os.path.basename(str(getattr(page, 'image_path')))}",
             "status": page.status,
             "review_complete": bool(getattr(page, "review_complete_at")),
+            "version": int(getattr(page, "version", 1)),
         }
         for page in page_rows
     ]
@@ -202,12 +251,17 @@ async def validate_document_page(document_id: str, page_id: str, payload: Valida
             payload.reviewed_token_ids,
             payload.review_complete,
             payload.structured_fields,
+            payload.page_version,
         )
     except ValueError as error:
         if str(error) == "document_not_found":
             raise HTTPException(status_code=404, detail="Document not found")
         if str(error) == "review_incomplete":
             raise HTTPException(status_code=409, detail="Review incomplete")
+        if str(error) == "version_required":
+            raise HTTPException(status_code=400, detail="Page version is required")
+        if str(error) == "version_conflict":
+            raise HTTPException(status_code=409, detail="Review out of date")
         raise
     logger.info("Validate page completed document_id=%s page_id=%s status=%s", document_id, page_id, status)
     return JSONResponse(
@@ -220,6 +274,30 @@ async def validate_document_page(document_id: str, page_id: str, payload: Valida
             }
         )
     )
+
+
+def _build_page_status(session, page: DocumentPage) -> dict:
+    token_count = session.execute(
+        select(func.count(Token.id)).where(Token.page_id == page.id)
+    ).scalar_one()
+    forced_review_count = session.execute(
+        select(func.count(Token.id))
+        .where(Token.page_id == page.id)
+        .where(Token.forced_review.is_(True))
+    ).scalar_one()
+    updated_at = getattr(page, "updated_at", None)
+    updated_at_value = updated_at.isoformat() if updated_at else None
+
+    return {
+        "page_id": page.id,
+        "page_index": int(getattr(page, "page_index")),
+        "status": page.status,
+        "review_complete": bool(getattr(page, "review_complete_at")),
+        "token_count": int(token_count or 0),
+        "forced_review_count": int(forced_review_count or 0),
+        "updated_at": updated_at_value,
+        "version": int(getattr(page, "version", 1)),
+    }
 
 
 @app.get("/documents/{document_id}")
@@ -246,6 +324,7 @@ async def get_document(document_id: str):
                 "image_height": int(getattr(page, "image_height")),
                 "status": page.status,
                 "review_complete": bool(getattr(page, "review_complete_at")),
+                "version": int(getattr(page, "version", 1)),
             }
             for page in pages
         ]
@@ -263,6 +342,78 @@ async def get_document(document_id: str):
                 "review_complete": bool(getattr(document, "review_complete_at")),
             }
         )
+
+
+@app.get("/documents/{document_id}/pages/status")
+async def get_document_page_statuses(document_id: str):
+    logger.debug("Get document statuses document_id=%s", document_id)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        pages = session.execute(
+            select(DocumentPage)
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_index.asc())
+        ).scalars().all()
+
+        page_payload = [_build_page_status(session, page) for page in pages]
+
+        return JSONResponse(
+            {
+                "document_id": document.id,
+                "status": document.status,
+                "review_complete": bool(getattr(document, "review_complete_at")),
+                "pages": page_payload,
+            }
+        )
+
+
+@app.get("/documents/{document_id}/pages/{page_id}/status")
+async def get_document_page_status(document_id: str, page_id: str):
+    logger.debug("Get document page status document_id=%s page_id=%s", document_id, page_id)
+    with get_session() as session:
+        document = session.get(Document, document_id)
+        page = session.get(DocumentPage, page_id)
+        if document is None or page is None or page.document_id != document_id:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        payload = _build_page_status(session, page)
+        payload["document_id"] = document.id
+        payload["document_status"] = document.status
+        payload["document_review_complete"] = bool(getattr(document, "review_complete_at"))
+        return JSONResponse(payload)
+
+
+@app.get("/documents/{document_id}/status/stream")
+async def stream_document_status(document_id: str, interval: float = 2.0):
+    logger.info("Status stream requested document_id=%s", document_id)
+
+    async def event_stream():
+        while True:
+            with get_session() as session:
+                document = session.get(Document, document_id)
+                if document is None:
+                    yield f"data: {json.dumps({'error': 'document_not_found'})}\n\n"
+                    break
+
+                pages = session.execute(
+                    select(DocumentPage)
+                    .where(DocumentPage.document_id == document_id)
+                    .order_by(DocumentPage.page_index.asc())
+                ).scalars().all()
+
+                payload = {
+                    "document_id": document.id,
+                    "status": document.status,
+                    "review_complete": bool(getattr(document, "review_complete_at")),
+                    "pages": [_build_page_status(session, page) for page in pages],
+                }
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(max(0.5, interval))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/documents/{document_id}/pages/{page_id}")
@@ -312,6 +463,7 @@ async def get_document_page(document_id: str, page_id: str):
                 "image_height": int(getattr(page, "image_height")),
                 "status": page.status,
                 "review_complete": bool(getattr(page, "review_complete_at")),
+                "version": int(getattr(page, "version", 1)),
                 "tokens": token_payload,
             }
         )
@@ -606,3 +758,8 @@ async def health_check():
     with engine.connect() as connection:
         connection.execute(sql_text("SELECT 1"))
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

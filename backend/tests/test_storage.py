@@ -21,6 +21,7 @@ class DummyUpload(UploadLike):
 
 
 def test_save_upload_rejects_unknown_extension(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRICT_MIME_VALIDATION", "0")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     upload = cast(UploadFile, DummyUpload("notes.txt", b"hello"))
     with pytest.raises(ValueError) as error:
@@ -29,6 +30,7 @@ def test_save_upload_rejects_unknown_extension(tmp_path, monkeypatch):
 
 
 def test_save_upload_pdf_converts_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRICT_MIME_VALIDATION", "0")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     upload = cast(UploadFile, DummyUpload("sample.pdf", b"%PDF-1.4"))
     fake_image = Image.new("RGB", (10, 10), "white")
@@ -45,3 +47,13 @@ def test_save_upload_pdf_converts_pages(tmp_path, monkeypatch):
     assert len(pages) == 2
     assert (tmp_path / f"{document_id}-page-0.png").exists()
     assert (tmp_path / f"{document_id}-page-1.png").exists()
+
+
+def test_save_upload_rejects_large_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRICT_MIME_VALIDATION", "0")
+    monkeypatch.setenv("MAX_UPLOAD_MB", "0")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    upload = cast(UploadFile, DummyUpload("sample.png", b"x"))
+    with pytest.raises(ValueError) as error:
+        save_upload(upload)
+    assert str(error.value) == "file_too_large"

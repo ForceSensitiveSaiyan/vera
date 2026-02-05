@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from app.db.session import Base, engine, get_session
 from app.models.documents import AuditLog, Correction, Document, DocumentPage, Token
 from app.schemas.documents import DocumentStatus
+from app.utils.time import utcnow
 
 
 def apply_corrections(
@@ -73,10 +74,10 @@ def apply_corrections(
                 .values(
                     status=DocumentStatus.validated.value,
                     validated_text=validated_text,
-                    review_complete_at=datetime.utcnow(),
+                    review_complete_at=utcnow(),
                 )
             )
-            validated_at = datetime.utcnow()
+            validated_at = utcnow()
             status_value = DocumentStatus.validated
         else:
             session.execute(
@@ -147,6 +148,7 @@ def apply_page_corrections(
     reviewed_token_ids: list[str],
     review_complete: bool,
     structured_fields: dict[str, str] | None = None,
+    page_version: int | None = None,
 ) -> tuple[str, DocumentStatus, datetime | None]:
     Base.metadata.create_all(bind=engine)
     corrections_by_token = {item["token_id"]: item["corrected_text"] for item in corrections}
@@ -157,6 +159,8 @@ def apply_page_corrections(
         page = session.get(DocumentPage, page_id)
         if document is None or page is None:
             raise ValueError("document_not_found")
+        if page_version is None:
+            raise ValueError("version_required")
         logger.debug("Apply page corrections document_id=%s page_id=%s", document_id, page_id)
 
         tokens = session.execute(
@@ -199,33 +203,40 @@ def apply_page_corrections(
             for line_index in sorted(validated_lines.keys())
         )
 
+        update_values = {
+            "version": DocumentPage.version + 1,
+        }
         if review_complete:
-            session.execute(
-                DocumentPage.__table__.update()
-                .where(DocumentPage.id == page_id)
-                .values(
-                    status=DocumentStatus.validated.value,
-                    validated_text=validated_text,
-                    review_complete_at=datetime.utcnow(),
-                )
+            update_values.update(
+                {
+                    "status": DocumentStatus.validated.value,
+                    "validated_text": validated_text,
+                    "review_complete_at": utcnow(),
+                }
             )
-            validated_at = datetime.utcnow()
+            validated_at = utcnow()
             status_value = DocumentStatus.validated
         else:
-            session.execute(
-                DocumentPage.__table__.update()
-                .where(DocumentPage.id == page_id)
-                .values(status=DocumentStatus.review_in_progress.value, review_complete_at=None)
+            update_values.update(
+                {
+                    "status": DocumentStatus.review_in_progress.value,
+                    "review_complete_at": None,
+                }
             )
             validated_at = None
             status_value = DocumentStatus.review_in_progress
 
         if structured_fields is not None:
-            session.execute(
-                DocumentPage.__table__.update()
-                .where(DocumentPage.id == page_id)
-                .values(structured_fields=json.dumps(structured_fields))
-            )
+            update_values["structured_fields"] = json.dumps(structured_fields)
+
+        result = session.execute(
+            DocumentPage.__table__.update()
+            .where(DocumentPage.id == page_id)
+            .where(DocumentPage.version == page_version)
+            .values(**update_values)
+        )
+        if result.rowcount == 0:
+            raise ValueError("version_conflict")
 
         if corrections_by_token:
             logger.info(
@@ -301,7 +312,7 @@ def apply_page_corrections(
                 .values(
                     status=DocumentStatus.validated.value,
                     validated_text=document_text,
-                    review_complete_at=datetime.utcnow(),
+                    review_complete_at=utcnow(),
                 )
             )
         else:

@@ -285,13 +285,44 @@ def test_page_export_allows_validated_page():
     assert payload["validated_text"] == "Acme Corp"
 
 
+def test_page_validate_requires_version():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+
+    response = client.post(
+        f"/documents/{document_id}/pages/{page_id}/validate",
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Page version is required"
+
+
+def test_page_validate_rejects_version_conflict():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.review_in_progress.value)
+
+    ok_response = client.post(
+        f"/documents/{document_id}/pages/{page_id}/validate",
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True, "page_version": 1},
+    )
+    assert ok_response.status_code == 200
+
+    conflict_response = client.post(
+        f"/documents/{document_id}/pages/{page_id}/validate",
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True, "page_version": 1},
+    )
+    assert conflict_response.status_code == 409
+    assert conflict_response.json()["detail"] == "Review out of date"
+
+
 def test_document_summary_requires_all_pages_reviewed():
     _reset_db()
     document_id, page_ids = _create_document_with_pages(DocumentStatus.review_in_progress.value, 2)
 
     response = client.post(
         f"/documents/{document_id}/pages/{page_ids[0]}/validate",
-        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True},
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True, "page_version": 1},
     )
 
     assert response.status_code == 200
@@ -306,10 +337,36 @@ def test_document_export_requires_all_pages_reviewed():
 
     response = client.post(
         f"/documents/{document_id}/pages/{page_ids[0]}/validate",
-        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True},
+        json={"corrections": [], "reviewed_token_ids": [], "review_complete": True, "page_version": 1},
     )
 
     assert response.status_code == 200
     export_response = client.get(f"/documents/{document_id}/export?format=json")
     assert export_response.status_code == 409
     assert export_response.json()["detail"] == "Document not validated"
+
+
+def test_page_status_endpoint_returns_counts():
+    _reset_db()
+    document_id, page_id = _create_document(DocumentStatus.ocr_done.value)
+    _create_token(document_id, page_id, forced_review=True, text="Item")
+
+    response = client.get(f"/documents/{document_id}/pages/{page_id}/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["page_id"] == page_id
+    assert payload["token_count"] == 1
+    assert payload["forced_review_count"] == 1
+
+
+def test_document_status_endpoint_returns_pages():
+    _reset_db()
+    document_id, page_ids = _create_document_with_pages(DocumentStatus.ocr_done.value, 2)
+
+    response = client.get(f"/documents/{document_id}/pages/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["document_id"] == document_id
+    assert len(payload["pages"]) == 2

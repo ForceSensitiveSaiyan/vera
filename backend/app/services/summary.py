@@ -7,16 +7,60 @@ import re
 import uuid
 
 import httpx
+import time
 from sqlalchemy import select, update
 
 from app.db.session import Base, engine, get_session
 from app.models.documents import AuditLog, Document, DocumentPage
 from app.schemas.documents import DocumentStatus
+from app.utils.metrics import SUMMARY_DURATION
+
+_RULES_CACHE: dict = {}
+
+
+def _load_rules() -> dict:
+    global _RULES_CACHE
+    if _RULES_CACHE:
+        return _RULES_CACHE
+    rules_path = os.getenv("EXTRACTION_RULES_PATH", "app/config/extraction_rules.json")
+    try:
+        with open(rules_path, "r", encoding="utf-8") as handle:
+            _RULES_CACHE = json.load(handle)
+    except FileNotFoundError:
+        _RULES_CACHE = {}
+    return _RULES_CACHE
+
+
+def _detect_doc_type(lines: list[str], rules: dict) -> str:
+    keywords = rules.get("doc_type_keywords", {})
+    normalized_lines = "\n".join(line.lower() for line in lines)
+    for doc_type, terms in keywords.items():
+        if any(term in normalized_lines for term in terms):
+            return doc_type
+    return "general"
+
+
+def _detect_locale(lines: list[str]) -> str:
+    euro_pattern = re.compile(r"\b\d{1,3}(?:\.\d{3})+,\d{2}\b")
+    comma_decimal_pattern = re.compile(r"\b\d{1,3},\d{2}\b")
+    for line in lines:
+        if euro_pattern.search(line) or comma_decimal_pattern.search(line):
+            return "EU"
+    return "US"
 
 
 
-def _build_summary_from_text(validated_text: str, model_override: str | None = None) -> tuple[list[str], dict[str, str]]:
+def _build_summary_from_text(
+    validated_text: str,
+    model_override: str | None = None,
+    doc_type_override: str | None = None,
+    locale_override: str | None = None,
+) -> tuple[list[str], dict[str, str]]:
     lines = [line.strip() for line in validated_text.splitlines() if line.strip()]
+
+    rules = _load_rules()
+    doc_type = doc_type_override or _detect_doc_type(lines, rules)
+    locale = locale_override or _detect_locale(lines)
 
     line_count = len(lines)
     word_count = sum(len(line.split()) for line in lines)
@@ -52,8 +96,10 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
     )
     number_amount_pattern = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b")
 
-    total_terms = ["total", "amount due", "balance due", "grand total", "total due"]
-    subtotal_terms = ["subtotal", "sub total", "tax", "vat", "amount", "balance", "due"]
+    total_terms = rules.get("total_terms", ["total", "amount due", "balance due", "grand total", "total due"])
+    subtotal_terms = rules.get(
+        "subtotal_terms", ["subtotal", "sub total", "tax", "vat", "amount", "balance", "due"]
+    )
 
     def normalize_amount(value: str) -> str:
         raw = value.strip()
@@ -74,7 +120,9 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
             decimal = "," if raw.rfind(",") > raw.rfind(".") else "."
             thousands = "." if decimal == "," else ","
             raw = raw.replace(thousands, "").replace(decimal, ".")
-        elif has_comma:
+        elif locale == "EU" and has_comma:
+            raw = raw.replace(".", "").replace(",", ".")
+        elif locale == "US" and has_comma:
             parts = raw.split(",")
             if len(parts[-1]) == 2:
                 raw = raw.replace(".", "").replace(",", ".")
@@ -167,7 +215,9 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
                 phones.append(value)
 
     def pick_vendor(candidate_lines: list[str]) -> str | None:
-        skip_terms = {"invoice", "receipt", "statement", "report", "form", "application"}
+        skip_terms = set(
+            rules.get("vendor_skip_terms", ["invoice", "receipt", "statement", "report", "form", "application"])
+        )
         for line in candidate_lines[:5]:
             normalized = line.lower()
             if any(term in normalized for term in skip_terms):
@@ -178,7 +228,9 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
         return None
 
     def pick_total(candidate_lines: list[str]) -> str | None:
-        total_terms = ["total", "amount due", "balance due", "amount", "grand total", "total due"]
+        total_terms = rules.get(
+            "total_terms", ["total", "amount due", "balance due", "amount", "grand total", "total due"]
+        )
         for line in candidate_lines:
             normalized = line.lower()
             if any(term in normalized for term in total_terms):
@@ -189,7 +241,7 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
 
     def pick_items(candidate_lines: list[str]) -> list[str]:
         items: list[str] = []
-        skip_terms = ["total", "subtotal", "tax", "amount due", "balance", "invoice", "receipt"]
+        skip_terms = rules.get("skip_terms", ["total", "subtotal", "tax", "amount due", "balance", "invoice", "receipt"])
         for line in candidate_lines:
             normalized = line.lower()
             if any(term in normalized for term in skip_terms):
@@ -375,6 +427,8 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
         "document_type": best_label,
         "document_type_confidence": confidence,
         "keywords": keyword_text,
+        "doc_type": doc_type,
+        "locale": locale,
     }
 
     return bullet_summary, structured_fields
@@ -383,6 +437,7 @@ def _build_summary_from_text(validated_text: str, model_override: str | None = N
 def build_summary(document_id: str, model_override: str | None = None) -> dict:
     Base.metadata.create_all(bind=engine)
     logger.info("Build summary document_id=%s", document_id)
+    start_time = time.perf_counter()
     with get_session() as session:
         document = session.get(Document, document_id)
         if document is None:
@@ -392,6 +447,9 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
         ).scalar_one()
         if document_status not in (DocumentStatus.validated.value, DocumentStatus.summarized.value):
             raise ValueError("document_not_validated")
+
+        doc_type_override = document.doc_type
+        locale_override = document.locale
 
         validated_text = session.execute(
             select(Document.validated_text).where(Document.id == document_id)
@@ -405,13 +463,22 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
         )
         session.commit()
 
-    bullet_summary, structured_fields = _build_summary_from_text(validated_text, model_override)
+    bullet_summary, structured_fields = _build_summary_from_text(
+        validated_text,
+        model_override,
+        doc_type_override=doc_type_override,
+        locale_override=locale_override,
+    )
 
     with get_session() as session:
         session.execute(
             update(Document)
             .where(Document.id == document_id)
-            .values(structured_fields=json.dumps(structured_fields))
+            .values(
+                structured_fields=json.dumps(structured_fields),
+                doc_type=structured_fields.get("doc_type"),
+                locale=structured_fields.get("locale"),
+            )
         )
         session.add(
             AuditLog(
@@ -423,6 +490,7 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
         )
         session.commit()
 
+    SUMMARY_DURATION.labels("document").observe(time.perf_counter() - start_time)
     return {
         "bullet_summary": bullet_summary,
         "structured_fields": structured_fields,
@@ -433,6 +501,7 @@ def build_summary(document_id: str, model_override: str | None = None) -> dict:
 def build_page_summary(document_id: str, page_id: str, model_override: str | None = None) -> dict:
     Base.metadata.create_all(bind=engine)
     logger.info("Build summary document_id=%s page_id=%s", document_id, page_id)
+    start_time = time.perf_counter()
     with get_session() as session:
         page = session.get(DocumentPage, page_id)
         if page is None or page.document_id != document_id:
@@ -467,6 +536,7 @@ def build_page_summary(document_id: str, page_id: str, model_override: str | Non
         )
         session.commit()
 
+    SUMMARY_DURATION.labels("page").observe(time.perf_counter() - start_time)
     return {
         "bullet_summary": bullet_summary,
         "structured_fields": structured_fields,
